@@ -23,7 +23,16 @@ build/
 *.swo
 
 # Output folders
-preprocess_egg_data/output/
+preprocess_egg_data/output/*
+!preprocess_egg_data/output/.gitkeep
 
 # Raw EGG data (large files)
-egg_data/
+egg_data/*
+!egg_data/.gitkeep
+
+# Debug/diagnostic scripts
+preprocess_egg_data/check_channels.py
+preprocess_egg_data/check_digital_channels.py
+
+# Documentation files (internal notes)
+metadata_field_sources.txt
