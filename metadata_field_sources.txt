@@ -1,0 +1,107 @@
+EGG METADATA 
+
+===========================
+
+This document provide details about egg preprocessing metadata files.
+Idicating some details that requires verification after efforts to read details from .acq and other files provided.
+
+
+METADATA FIELDs
+--------------------------
+
+subject
+    Description:    Subject identifier used to locate the EGG data file
+    Example:        VITD0107, VITD0126, VITD0128
+    Used for:       Finding the ACQ file at egg_data/{subject}_Acq/{subject}_EGG.acq
+
+run
+    Description:    Run/session number for subjects with multiple recordings
+    Example:        1, 2, 3
+    Used for:       Distinguishing multiple EGG recordings for the same subject
+
+mri_length
+    Description:    Duration of the fMRI scan in seconds
+    Example:        600 (for a 10-minute scan)
+    Used for:       Slicing the EGG recording to match the fMRI acquisition period
+    Note:           The EGG recording is typically longer than the fMRI scan
+
+num_channles
+    Description:    Number of EGG electrode channels in the recording
+    Example:        4 (channels 0-3 in the ACQ file)
+    Used for:       Extracting the correct channels for spectral analysis
+
+trigger_start
+    Description:    Time (in seconds) when the fMRI scan started within the EGG recording
+    Example:        0, 45, or "auto" for automatic detection
+    Used for:       Aligning the EGG signal with the fMRI acquisition
+    Note:           If set to a number, uses that as the start time in seconds
+                    If set to "auto", detects from trigger channel transitions
+
+dominant_channel
+    Description:    Which EGG channel contains the strongest gastric signal
+    Example:        0, 1, 2, 3, or "auto" for automatic detection
+    Used for:       Selecting the best channel for final filtered output
+    Note:           If "auto", determined by spectral analysis (highest power in
+                    normogastric range 0.033-0.066 Hz)
+
+dominant_frequency
+    Description:    The peak gastric slow-wave frequency in Hz
+    Example:        0.05 (corresponds to 3 cycles per minute)
+    Used for:       Centering the bandpass filter around this frequency
+    Note:           Normal gastric frequency is 0.033-0.066 Hz (2-4 cycles/min)
+                    If "auto", determined from Welch power spectral density
+
+
+DETECTABLE FROM .ACQ FILE
+-------------------------
+
+Column          Detectable?     How
+------          -----------     ---
+subject         Yes             From filename (e.g., VITD0107_EGG.acq -> VITD0107)
+num_channles    Yes             Count channels with "EGG" in name
+trigger_start   Partial         From trigger channel transitions - but only if
+                                trigger signal was properly recorded
+
+
+NOT DETECTABLE FROM .ACQ FILE
+-----------------------------
+
+Column          Why
+------          ---
+run             Not encoded in the ACQ file - requires external info or
+                filename convention
+mri_length      fMRI scan duration is not stored in EGG recording - requires
+                fMRI metadata (PAR/DICOM files or study protocol). I checked details a few 
+                dicom and par files but need verification of the mri_length.
+
+
+COMPUTED DURING PROCESSING (not from raw file)
+----------------------------------------------
+
+Column              How
+------              ---
+dominant_channel    Determined by spectral analysis (Welch PSD) during preprocessing
+dominant_frequency  Peak frequency in normogastric range (0.033-0.066 Hz) found
+                    during preprocessing
+
+
+CURRENT METADATA VALUES FOR THE 3 SAMPLE SUBJECTS
+-----------------------
+
+subject,run,mri_length,num_channles,trigger_start,dominant_channel,dominant_frequency
+VITD0107,1,600,4,0,auto,auto
+VITD0126,1,547,4,0,auto,auto
+VITD0128,1,600,4,45,auto,auto
+
+
+VALUES REQUIRING VERIFICATION
+-----------------------------
+
+Subject     Field           Current Value   Notes
+-------     -----           -------------   -----
+VITD0107    mri_length      600             Estimated - trigger channel was constant
+VITD0107    trigger_start   0               Assumed start - no trigger pulse detected
+VITD0126    mri_length      547             From trigger falling edge at 547.5 sec
+VITD0128    mri_length      600             Estimated - trigger unclear
+VITD0128    trigger_start   45              Trigger rose at 45.11 sec
+ALL         run             1               Assumed single run - needs confirmation
