@@ -1,0 +1,435 @@
+================================================================================
+EGG-BRAIN SYNCHRONY ANALYSIS PIPELINE
+From Raw Data to FDR-Corrected Population & Individual-Level Significance
+================================================================================
+
+This pipeline analyzes the synchronization between gastric (EGG) signals and
+brain BOLD signals at both voxel and ROI levels.
+
+SUBJECTS: VITD0107, VITD0126, VITD0128 (3 subjects with both EGG and brain data)
+
+STEP 1: DATA ACQUISITION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌─────────────────┐                      ┌─────────────────┐
+    │   EGG Data      │                      │   BOLD Data     │
+    │  (Raw Gastric)  │                      │   (fMRI scans)  │
+    └────────┬────────┘                      └────────┬────────┘
+             │                                        │
+             │ Surface electrodes                     │ 3T Scanner
+             │ on abdomen                             │ TR = 2s
+             │                                        │
+             ▼                                        ▼
+    ┌─────────────────┐                      ┌─────────────────┐
+    │ EGG Preprocessing│                     │  fMRI Preproc.  │
+    │ (preprocess_     │                     │  (dswau files)  │
+    │  gastric_data.py)│                     │  Preprocessing  │
+    └────────┬────────┘                      └────────┬────────┘
+             │                                        │
+             │ Artifact removal                       │ Motion correction
+             │ Bandpass filtering                     │ Normalization
+             ▼                                        ▼
+    ┌─────────────────┐                      ┌─────────────────┐
+    │ Clean EGG Signal│                      │  Preprocessed   │
+    │   at 10 Hz      │                      │  BOLD Signal    │
+    │                 │                      │  4D NIfTI files │
+    │ gast_data*.npy  │                      │  dswauResting   │
+    │ max_freq*.npy   │                      │  State_EGG*.nii │
+    └────────┬────────┘                      └────────┬────────┘
+             │                                        │
+             │                                        │
+             ▼                                        ▼
+
+
+STEP 2: SPECTRAL ANALYSIS & FREQUENCY-SPECIFIC FILTERING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌─────────────────┐
+    │Power Spectral   │
+    │   Density       │
+    │   (Welch)       │
+    └────────┬────────┘
+             │
+             │ Identify subject-specific
+             │ gastric peak frequency
+             │ (normogastric: 0.033-0.066 Hz)
+             ▼
+    ┌─────────────────┐
+    │  Peak Frequency │
+    │   f_gastric     │◄─────────────────────┐
+    │  (e.g., 0.05 Hz)│                      │
+    └────────┬────────┘                      │
+             │                                │
+             │                                │
+             ├────────────────────────────────┤
+             │                                │
+             ▼                                ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │Gastric Bandpass │              │ BOLD Bandpass   │
+    │     Filter      │              │     Filter      │
+    │                 │              │                 │
+    │f_gastric ± 0.015│◄─────────────┤f_gastric ± 0.015│
+    │                 │  Same freq   │                 │
+    │ FIR, Hamming    │  for both    │ FIR, Hamming    │
+    │ window          │              │ window          │
+    │ Zero-phase      │              │ Zero-phase      │
+    └────────┬────────┘              └────────┬────────┘
+             │                                │
+             │ Already at 10 Hz               │ BOLD at fMRI
+             │ (intermediate_sample_rate)     │ sample rate (0.5 Hz)
+             ▼                                ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │Filtered Gastric │              │Filtered BOLD    │
+    │    Signal       │              │  (per voxel or  │
+    │ G(t) @ 10 Hz    │              │   per ROI)      │
+    └────────┬────────┘              └────────┬────────┘
+             │                                │
+             │ Resample to fMRI rate          │
+             │ (0.5 Hz for alignment)         │
+             ▼                                ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │Aligned Gastric  │              │Aligned BOLD     │
+    │  G(t) @ 0.5 Hz  │              │ B(t) @ 0.5 Hz   │
+    └────────┬────────┘              └────────┬────────┘
+             │                                │
+             │                                │
+             ▼                                ▼
+
+
+STEP 3: HILBERT TRANSFORM & INSTANTANEOUS PHASE/AMPLITUDE EXTRACTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌─────────────────┐              ┌─────────────────┐
+    │Hilbert Transform│              │Hilbert Transform│
+    │   on Gastric    │              │    on BOLD      │
+    └────────┬────────┘              └────────┬────────┘
+             │                                │
+             │ Analytic signal                │ Analytic signal
+             │                                │
+             ├────────────┬───────────        ├────────────┬───────────
+             ▼            ▼                   ▼            ▼
+    ┌────────────┐ ┌────────────┐   ┌────────────┐ ┌────────────┐
+    │  Gastric   │ │  Gastric   │   │   BOLD     │ │   BOLD     │
+    │ Envelope   │ │   Phase    │   │ Envelope   │ │   Phase    │
+    │            │ │            │   │ (per voxel │ │ (per voxel │
+    │  A_g(t)    │ │  φ_g(t)    │   │  or ROI)   │ │  or ROI)   │
+    └────────────┘ └────────┬───┘   │  A_b(t)    │ │  φ_b(t)    │
+          │                 │       └────────────┘ └────────┬───┘
+          │                 │              │                 │
+          │                 │              │                 │
+          │                 └──────┬───────┘                 │
+          │                        │                         │
+          │                        ▼                         │
+          │               ┌─────────────────┐               │
+          │               │ Phase Difference│               │
+          │               │                 │               │
+          │               │ Δφ(t) = φ_b(t) -│               │
+          │               │         φ_g(t)  │               │
+          │               └────────┬────────┘               │
+          │                        │                         │
+          │                        │                         │
+          └────────────────────────┼─────────────────────────┘
+                                   │
+                                   ▼
+
+
+STEP 4: SYNCHRONY COMPUTATION (PLV & awPLV)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                  PHASE LOCKING VALUE (PLV)                      │
+    │                                                                 │
+    │                         ┌──  T          ─┐                      │
+    │                         │  ──            │                      │
+    │         PLV = │ 1/T  Σ  │ e^(iΔφ(t))   │ │                     │
+    │                         │               │ │                     │
+    │                         └─  t=1         ─┘                      │
+    │                                                                 │
+    │  where:                                                         │
+    │    - T = total number of time points                            │
+    │    - Δφ(t) = instantaneous phase difference (BOLD - Gastric)    │
+    │    - | · | = absolute value (modulus)                           │
+    │    - Range: [0, 1]                                              │
+    │    - 0 = no phase locking, 1 = perfect phase locking            │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                        ┌────────────────────┐
+                        │   PLV Empirical    │
+                        │   (per subject,    │
+                        │    per voxel/ROI)  │
+                        └──────────┬─────────┘
+                                   │
+                                   │
+    ┌─────────────────────────────────────────────────────────────────┐
+    │          AMPLITUDE-WEIGHTED PLV (awPLV)                         │
+    │                                                                 │
+    │                       ┌──  T                    ─┐              │
+    │                       │  ──                      │              │
+    │      awPLV = │ 1/T  Σ │ w(t) · e^(iΔφ(t))      │ │             │
+    │                       │                         │ │             │
+    │                       └─  t=1                   ─┘              │
+    │                                                                 │
+    │  where the weight function is:                                  │
+    │                                                                 │
+    │              w(t) = A_g(t) · A_b(t)                             │
+    │                     ─────────────────                           │
+    │                      Σ A_g(τ) · A_b(τ)                          │
+    │                      τ                                          │
+    │                                                                 │
+    │  where:                                                         │
+    │    - A_g(t) = gastric envelope (amplitude)                      │
+    │    - A_b(t) = BOLD envelope (amplitude)                         │
+    │    - w(t) is normalized such that Σw(t) = 1                     │
+    │    - Range: [0, 1]                                              │
+    │    - Emphasizes high-amplitude coupling periods                 │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                        ┌────────────────────┐
+                        │  awPLV Empirical   │
+                        │   (per subject,    │
+                        │    per voxel/ROI)  │
+                        └──────────┬─────────┘
+                                   │
+                                   ▼
+
+
+STEP 5: MISMATCH NULL DISTRIBUTION GENERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    For each subject's BOLD signal (voxel or ROI):
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Subject A, Voxel/ROI X                                         │
+    │                                                                 │
+    │  Empirical:                                                     │
+    │    PLV(Gastric_A, BOLD_A_voxelX)                                │
+    │    awPLV(Gastric_A, BOLD_A_voxelX)                              │
+    │                                                                 │
+    │  Null Distribution (N-1 mismatch pairings):                     │
+    │    PLV(Gastric_B, BOLD_A_voxelX)                                │
+    │    PLV(Gastric_C, BOLD_A_voxelX)                                │
+    │    ...                                                          │
+    │                                                                 │
+    │    awPLV(Gastric_B, BOLD_A_voxelX)                              │
+    │    awPLV(Gastric_C, BOLD_A_voxelX)                              │
+    │    ...                                                          │
+    │                                                                 │
+    │  → N_null samples for PLV (2 samples with 3 subjects)           │
+    │  → N_null samples for awPLV (2 samples with 3 subjects)         │
+    │                                                                 │
+    │  Null Hypothesis: No subject-specific gastric-brain coupling    │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                        ┌────────────────────┐
+                        │  Null Distributions│
+                        │                    │
+                        │  PLV_null array    │
+                        │  awPLV_null array  │
+                        │                    │
+                        │  (per subject,     │
+                        │   per voxel/ROI)   │
+                        └──────────┬─────────┘
+                                   │
+                                   ▼
+
+
+STEP 6: INDIVIDUAL-LEVEL STATISTICAL TESTING (FIRST LEVEL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    For each subject and each voxel/ROI:
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Individual P-value Calculation:                                │
+    │                                                                 │
+    │  p_PLV = proportion of null PLV values ≥ empirical PLV          │
+    │        = #{PLV_null ≥ PLV_empirical} / N_null                   │
+    │                                                                 │
+    │  p_awPLV = proportion of null awPLV values ≥ empirical awPLV    │
+    │          = #{awPLV_null ≥ awPLV_empirical} / N_null             │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Multiple Comparison Correction (Individual Level):             │
+    │                                                                 │
+    │  FDR Correction (Benjamini-Hochberg) across all voxels/ROIs:    │
+    │                                                                 │
+    │  For VOXEL analysis (~100,000 tests per subject):               │
+    │    - Input: All p-values across voxels                          │
+    │    - Output: q-values (FDR-corrected p-values)                  │
+    │    - Threshold: q < 0.05                                        │
+    │                                                                 │
+    │  For ROI analysis (~132 tests per subject):                     │
+    │    - Input: All p-values across ROIs                            │
+    │    - Output: q-values (FDR-corrected p-values)                  │
+    │    - Threshold: q < 0.05                                        │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                        ┌────────────────────┐
+                        │ INDIVIDUAL RESULTS │
+                        │                    │
+                        │ Subject-level maps │
+                        │ - PLV empirical    │
+                        │ - awPLV empirical  │
+                        │ - PLV delta        │
+                        │ - Z-scores         │
+                        │ - p-values         │
+                        │ - FDR sig mask     │
+                        │                    │
+                        └──────────┬─────────┘
+                                   │
+                                   │
+                                   ▼
+
+
+STEP 7: GROUP-LEVEL STATISTICAL TESTING (SECOND LEVEL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    For VOXEL analysis:
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Group-Level Test (One-Sample T-test at each voxel):            │
+    │                                                                 │
+    │  For each voxel V:                                              │
+    │    - Collect PLV/awPLV delta maps from 3 subjects               │
+    │    - One-sample t-test: Is mean delta > 0 across subjects?      │
+    │    - FDR correction across all voxels                           │
+    │                                                                 │
+    │  Output:                                                        │
+    │    - Group mean PLV map                                         │
+    │    - Group t-statistic map                                      │
+    │    - FDR-corrected significance map                             │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+
+    For ROI analysis:
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Group-Level Test (per ROI, 132 brain atlas regions):           │
+    │                                                                 │
+    │  For each ROI R:                                                │
+    │    - Collect PLV from 3 subjects                                │
+    │    - Compare empirical vs null distribution                     │
+    │    - FDR correction across all ROIs                             │
+    │                                                                 │
+    │  Output:                                                        │
+    │    - ROI-level PLV and awPLV heatmaps                           │
+    │    - Significance bar plots                                     │
+    │    - Summary statistics CSV                                     │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                        ┌────────────────────┐
+                        │   GROUP RESULTS    │
+                        │                    │
+                        │ Voxel-level:       │
+                        │   - Mean PLV/awPLV │
+                        │   - T-stat maps    │
+                        │   - FDR sig maps   │
+                        │                    │
+                        │ ROI-level:         │
+                        │   - PLV per ROI    │
+                        │   - awPLV per ROI  │
+                        │   - Significance   │
+                        │                    │
+                        └────────────────────┘
+
+
+STEP 8: FINAL OUTPUT & VISUALIZATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Output Files:                                                  │
+    │                                                                 │
+    │  SCRIPTS:                                                       │
+    │    1. voxel_based_first_level.py                                │
+    │       - First-level voxel-wise EGG-brain synchrony              │
+    │       - Individual subject PLV/awPLV maps                       │
+    │       - Null distribution via mismatch                          │
+    │       - FDR correction per subject                              │
+    │                                                                 │
+    │    2. voxel_based_second_level_v3.py                            │
+    │       - Group-level voxel-wise analysis                         │
+    │       - One-sample t-tests across subjects                      │
+    │       - Group mean maps and statistical maps                    │
+    │                                                                 │
+    │    3. roi_based_analysis.py                                     │
+    │       - ROI-level EGG-brain synchrony using atlas               │
+    │       - 132 brain regions from Harvard-Oxford atlas             │
+    │       - ROI-level PLV/awPLV with significance testing           │
+    │       - Heatmaps and bar plots                                  │
+    │                                                                 │
+    │  OUTPUT DIRECTORIES:                                            │
+    │    synchrony_analysis/output/                                   │
+    │    ├── voxel_analysis/          (first-level subject maps)      │
+    │    │   ├── VITD0107/                                            │
+    │    │   ├── VITD0126/                                            │
+    │    │   └── VITD0128/                                            │
+    │    ├── group_analysis/          (second-level group maps)       │
+    │    ├── roi_analysis/            (ROI-level results)             │
+    │    └── plots/                   (all visualizations)            │
+    │        ├── voxel_analysis/                                      │
+    │        ├── group_analysis/                                      │
+    │        └── roi_analysis/                                        │
+    │                                                                 │
+    │  KEY OUTPUT FILES:                                              │
+    │    - individual_level_statistics.csv                             │
+    │    - group_level_summary.csv                                    │
+    │    - roi_synchrony_results.csv                                  │
+    │    - roi_summary_statistics.csv                                 │
+    │    - NIfTI maps (plv, awplv, t-stat, p-value, fdr)             │
+    │    - Brain map visualizations                                   │
+    │    - ROI heatmaps and bar plots                                 │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+ANALYSIS OVERVIEW
+================================================================================
+
+DATA:
+  3 subjects with both EGG and preprocessed brain (BOLD) data:
+    - VITD0107
+    - VITD0126
+    - VITD0128
+
+  Brain data: dswauRestingState_EGG_*.nii (4D preprocessed fMRI)
+  EGG data:   gast_data_*_run1strict.npy  (preprocessed gastric signal)
+  Atlas:      132-region brain atlas (Harvard-Oxford cortical/subcortical)
+
+ANALYSIS APPROACHES:
+  1. Voxel-based: Synchrony computed at every brain voxel
+     - First level: Individual subject maps
+     - Second level: Group statistics across subjects
+
+  2. ROI-based: Synchrony computed per atlas region
+     - Mean time series extracted per ROI
+     - PLV/awPLV between gastric and each ROI
+     - Significance testing with FDR correction
+
+NOTES:
+  - With only 3 subjects, group-level statistics have limited power
+  - Individual-level results (first level) are more informative
+  - ROI analysis provides interpretable region-specific results
+  - Mismatch null distribution is limited to 2 null samples per subject
+
+Based on analysis provided by Levakov
+https://github.com/GidLev/brain_gastric_synchronization_2023/tree/master.
+
+================================================================================
+END OF PIPELINE
+================================================================================
+

@@ -89,3 +89,22 @@ multi_thread = True
 
 # Number of parallel threads for batch processing
 num_threads = 8
+
+# =============================================================================
+# SYNCHRONY ANALYSIS CONFIGURATION
+# =============================================================================
+
+# fMRI sampling rate (Hz) - typically 0.5 Hz for TR=2s
+sample_rate_fmri = 0.5
+
+# Extra time to cut from edges to avoid filter edge effects (seconds)
+extra_cut = 30
+
+# Main project path for synchrony analysis outputs
+main_project_path = os.path.dirname(os.path.dirname(__file__))
+
+# Path to brain data (preprocessed fMRI NIfTI files)
+brain_data_path = os.path.join(main_project_path, 'subject_data_nii')
+
+# Path to atlas for ROI-based analysis
+atlas_path = os.path.join(main_project_path, 'atlas')

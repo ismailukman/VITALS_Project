@@ -36,3 +36,11 @@ preprocess_egg_data/check_digital_channels.py
 
 # Documentation files (internal notes)
 metadata_field_sources.txt
+
+# Large data files (atlas, brain NIfTI)
+atlas/
+subject_data_nii/
+
+# Synchrony analysis output (large result files)
+synchrony_analysis/output/*
+!synchrony_analysis/output/.gitkeep

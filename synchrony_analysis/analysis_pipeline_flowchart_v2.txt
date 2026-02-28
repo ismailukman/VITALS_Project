@@ -1,0 +1,928 @@
+================================================================================
+          GASTRIC-BRAIN SYNCHRONY ANALYSIS PIPELINE FLOWCHART V2
+================================================================================
+
+Version: 2.0
+Focus: Voxel-wise brain-gastric synchrony using PLV and awPLV
+Date: December 19, 2024
+
+================================================================================
+                              PIPELINE OVERVIEW
+================================================================================
+
+This pipeline quantifies phase synchronization between gastric electrical
+rhythm and whole-brain voxel activity during resting-state fMRI.
+
+KEY FEATURES:
+  • Voxel-wise analysis (~270,000 voxels per subject)
+  • Dual synchrony metrics: PLV and awPLV
+  • Two null distribution approaches (V2: temporal permutation, V3: mismatch)
+  • Multiple comparison correction (FDR and Bonferroni)
+  • Group-level statistical testing with FSL Randomise
+
+INPUT DATA:
+  • AFNI preprocessed fMRI (MNI space, 2mm resolution)
+  • Preprocessed gastric (EGG) signals (10 Hz sampling)
+  • Gastric peak frequencies per subject
+
+OUTPUT:
+  • Individual subject-level synchrony maps (NIfTI)
+  • Statistical maps (p-values, effect sizes)
+  • Group-level results (FSL Randomise outputs)
+  • Summary statistics (CSV files)
+
+================================================================================
+                        STEP 0: PREREQUISITES
+================================================================================
+
+ENVIRONMENT SETUP:
+┌─────────────────────────────────────────────────────────────────────────┐
+│ conda activate brain_gut                                                │
+│ export FSL_DIR=/usr/local/fsl                                          │
+│ cd main_project_path/code                                              │
+└─────────────────────────────────────────────────────────────────────────┘
+
+REQUIRED PYTHON PACKAGES:
+  • numpy, pandas, scipy     - Numerical computing and data manipulation
+  • nibabel, nilearn         - Neuroimaging I/O and analysis
+  • matplotlib, seaborn      - Visualization
+  • mne                      - Signal processing (filtering)
+  • scikit-learn             - Machine learning utilities
+  • nipype                   - FSL interface for group analysis
+
+DATA REQUIREMENTS PER SUBJECT-RUN:
+  1. AFNI Preprocessed Brain:
+     Location: BIDS_data/soroka/sub-{subject}/pb05*.nii.gz
+     Format: NIfTI, MNI space, TR=2s (0.5 Hz)
+
+  2. Preprocessed Gastric Signal:
+     Location: derivatives/brain_gast/{subject}/{subject}{run}/
+     Files: gast_data_*_sliced.npy (if already sliced)
+     Format: NumPy array, 10 Hz sampling
+
+  3. Gastric Peak Frequency:
+     Location: Same as gastric signal
+     File: max_freq*_strict.npy
+     Content: Single float value (Hz)
+
+METADATA:
+  • Full dataset: dataframes/egg_brain_meta_data.csv (84 subject-run pairs)
+  • Test subset: dataframes/egg_brain_meta_data_10subjects.csv (10 runs)
+
+================================================================================
+                   STEP 1: DATA PREPARATION (prepare_afni_data.py)
+================================================================================
+
+PURPOSE: Convert AFNI preprocessed brain data to format required for synchrony
+
+SCRIPT: python synchrony_analysis/prepare_afni_data.py <subject> <run>
+
+WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  INPUT: AFNI preprocessed fMRI                                         │
+│  ├─ pb05.sub-{subject}.r0{run}.scale.nii.gz (scaled)                  │
+│  ├─ pb04.sub-{subject}.r0{run}.blur.nii.gz (smoothed)                 │
+│  └─ errts.sub-{subject}.r0{run}.*.nii.gz (residuals)                  │
+│                                                                         │
+│  PROCESSING:                                                            │
+│  ├─ 1. Load AFNI NIfTI file (try pb05 → pb04 → pb03 → errts)         │
+│  ├─ 2. Load or create brain mask (whole-brain or custom)              │
+│  ├─ 3. Extract voxel timeseries (reshape 4D → 2D: voxels × time)     │
+│  ├─ 4. Apply bandpass filter (0.02-0.08 Hz, gastric range)           │
+│  ├─ 5. Save masked brain data                                         │
+│  └─ 6. Create symlink to mask in derivatives root                     │
+│                                                                         │
+│  OUTPUT:                                                                │
+│  ├─ derivatives/brain_gast/{subject}/{subject}{run}/                  │
+│  │   ├─ func_filtered_*_sliced.npz (brain signal: N_voxels × N_time) │
+│  │   ├─ mask_*_strict.npz (brain mask: boolean 3D array)             │
+│  │   └─ {subject}_*_bold_strict.nii.gz (preprocessed fMRI symlink)   │
+│  └─ derivatives/brain_gast/mask_*_strict.npz (symlink to mask)        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+KEY PARAMETERS (from config.py):
+  • sample_rate_fmri = 0.5 Hz (TR = 2s)
+  • clean_level = 'strict'
+  • Bandpass filter: 0.02-0.08 Hz (gastric rhythm range)
+
+NOTES:
+  • Tries multiple AFNI file types in order of preference
+  • Falls back to fMRIPrep data if AFNI not available
+  • Creates mask matching filtered brain signal dimensions
+  • Handles both preprocessed runs and residual timeseries
+
+================================================================================
+                 STEP 2: SIGNAL PREPROCESSING (signal_slicing_v2.py)
+================================================================================
+
+PURPOSE: Temporally align gastric and brain signals
+
+SCRIPT: python synchrony_analysis/signal_slicing_v2.py <subject> <run>
+
+WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  INPUT:                                                                 │
+│  ├─ Gastric signal (raw or preprocessed)                              │
+│  ├─ Brain signal (from Step 1)                                        │
+│  └─ fMRI acquisition metadata (TR, duration)                          │
+│                                                                         │
+│  PROCESSING:                                                            │
+│  ├─ 1. Load gastric signal                                            │
+│  │    └─ If not preprocessed: bandpass filter (0.02-0.08 Hz)         │
+│  ├─ 2. Load brain signal (N_voxels × N_timepoints)                   │
+│  ├─ 3. Determine temporal alignment                                   │
+│  │    ├─ Calculate expected fMRI timepoints                           │
+│  │    ├─ Match gastric signal duration to fMRI                        │
+│  │    └─ Handle trigger start timing                                  │
+│  ├─ 4. Slice signals to common temporal extent                        │
+│  │    └─ Both signals now cover identical time period                 │
+│  └─ 5. Save synchronized signals                                      │
+│                                                                         │
+│  OUTPUT:                                                                │
+│  ├─ gast_data_{subject}_run{run}{clean_level}_sliced.npy             │
+│  │   Shape: (N_timepoints_gastric,) at 10 Hz                         │
+│  └─ func_filtered_{subject}_run{run}{clean_level}_sliced.npz         │
+│      Shape: (N_voxels, N_timepoints_fmri) at 0.5 Hz                  │
+│      Key: 'brain_signal'                                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+TEMPORAL ALIGNMENT EXAMPLE:
+  Gastric: 10 Hz sampling × 600s scan = 6,000 timepoints
+  Brain:   0.5 Hz (TR=2s) × 300 TRs = 300 timepoints
+  After slicing: Both cover same 600s period (different sampling rates)
+
+================================================================================
+           STEP 3A: INDIVIDUAL-LEVEL ANALYSIS V2 (voxel_based_analysis_v2.py)
+================================================================================
+
+PURPOSE: Voxel-wise PLV/awPLV with temporal permutation null distribution
+
+SCRIPT: python synchrony_analysis/voxel_based_analysis_v2.py <subject> <run>
+
+NULL DISTRIBUTION APPROACH:
+  • Temporal permutation (circular rolling)
+  • Roll gastric signal by 1-minute increments
+  • Preserves autocorrelation structure
+  • Generates ~200-300 null samples per subject
+
+WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  A. LOAD DATA                                                           │
+│  ├─ Gastric signal (sliced, 10 Hz)                                    │
+│  ├─ Brain signal (sliced, N_voxels × N_time)                          │
+│  ├─ Brain mask (3D boolean array)                                     │
+│  └─ Original fMRI (for spatial reference)                             │
+│                                                                         │
+│  B. COMPUTE EMPIRICAL SYNCHRONY                                         │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ PLV CALCULATION:                                                │   │
+│  │ 1. Extract phase using Hilbert transform                        │   │
+│  │    brain_phase = angle(hilbert(brain_signal))  [N_voxels × N_t] │   │
+│  │    gastric_phase = angle(hilbert(gastric_resampled))  [N_t]     │   │
+│  │                                                                  │   │
+│  │ 2. Compute phase difference                                     │   │
+│  │    phase_diff = brain_phase - gastric_phase  [N_voxels × N_t]   │   │
+│  │                                                                  │   │
+│  │ 3. Calculate PLV per voxel                                      │   │
+│  │    PLV = |mean(exp(1j * phase_diff), axis=time)|  [N_voxels]    │   │
+│  │    Range: [0, 1] where 0=no sync, 1=perfect sync                │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ awPLV CALCULATION:                                              │   │
+│  │ 1. Resample gastric to brain sampling rate (10 Hz → 0.5 Hz)    │   │
+│  │    Using cubic interpolation                                    │   │
+│  │                                                                  │   │
+│  │ 2. Extract amplitudes using Hilbert transform                  │   │
+│  │    brain_amp = |hilbert(brain_signal)|  [N_voxels × N_t]        │   │
+│  │    gastric_amp = |hilbert(gastric_resampled)|  [N_t]            │   │
+│  │                                                                  │   │
+│  │ 3. Calculate amplitude weights                                  │   │
+│  │    amp_product = brain_amp * gastric_amp  [N_voxels × N_t]      │   │
+│  │    weights = amp_product / sum(amp_product, axis=time)          │   │
+│  │                                                                  │   │
+│  │ 4. Compute weighted PLV                                         │   │
+│  │    phase_diff = angle(brain_analytic) - angle(gastric_analytic) │   │
+│  │    awPLV = |sum(weights * exp(1j * phase_diff), axis=time)|     │   │
+│  │    Range: [0, 1], emphasizes high-amplitude coupling            │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  C. COMPUTE NULL DISTRIBUTION (TEMPORAL PERMUTATION)                    │
+│  ├─ Parameters:                                                        │
+│  │   ├─ Roll increment: 1 minute (sample_per_min samples)            │
+│  │   ├─ Number of permutations: (scan_duration - 2min) / TR          │
+│  │   └─ Typical: ~200-300 permutations per 10-15 min scan            │
+│  │                                                                     │
+│  ├─ For each permutation i:                                           │
+│  │   ├─ Roll gastric: gastric_perm = roll(gastric, 60s + i*TR)      │
+│  │   ├─ Compute PLV_null[i] for all voxels                           │
+│  │   └─ Compute awPLV_null[i] for all voxels                         │
+│  │                                                                     │
+│  └─ Result: Null distributions [N_voxels × N_permutations]            │
+│                                                                         │
+│  D. STATISTICAL INFERENCE (PER VOXEL)                                   │
+│  ├─ P-values (uncorrected):                                           │
+│  │   p = (# null samples ≥ empirical) / N_permutations                │
+│  │                                                                     │
+│  ├─ Effect size:                                                       │
+│  │   delta = empirical - median(null)                                 │
+│  │                                                                     │
+│  └─ Null statistics:                                                   │
+│      ├─ plv_permut_median = median across permutations                │
+│      └─ (No multiple comparison correction at this stage)             │
+│                                                                         │
+│  E. SAVE OUTPUTS (8 NIFTI MAPS)                                         │
+│  ├─ PLV Maps:                                                          │
+│  │   ├─ plvs_empirical_*.nii.gz                                       │
+│  │   ├─ plv_p_vals_*.nii.gz                                           │
+│  │   ├─ plv_delta_*.nii.gz                                            │
+│  │   └─ plv_permut_median_*.nii.gz                                    │
+│  │                                                                     │
+│  ├─ awPLV Maps:                                                        │
+│  │   ├─ awplvs_empirical_*.nii.gz                                     │
+│  │   ├─ awplv_p_vals_*.nii.gz                                         │
+│  │   ├─ awplv_delta_*.nii.gz                                          │
+│  │   └─ awplv_permut_median_*.nii.gz                                  │
+│  │                                                                     │
+│  └─ Visualization:                                                     │
+│      └─ plots/brain_gast/{subject}/{subject}{run}/*.png               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+OUTPUT LOCATION:
+  derivatives/brain_gast/{subject}/{subject}{run}/
+
+EXAMPLE OUTPUT (for AE run 1):
+  PLV stats: mean=0.199, std=0.101
+  awPLV stats: mean=0.272, std=0.133
+  Saved 210 permutations for null distributions
+
+ADVANTAGES OF V2:
+  ✓ Subject-specific null distribution
+  ✓ Preserves temporal autocorrelation
+  ✓ Large number of null samples (~200-300)
+  ✓ No assumptions about between-subject similarity
+
+LIMITATIONS OF V2:
+  ⚠ Assumes temporal independence after 1-minute shift
+  ⚠ No population-level comparison
+  ⚠ Multiple comparison correction must be applied separately
+
+================================================================================
+           STEP 3B: INDIVIDUAL-LEVEL ANALYSIS V3 (voxel_based_analysis_v3.py)
+================================================================================
+
+PURPOSE: Voxel-wise PLV/awPLV with between-subject mismatch null distribution
+
+SCRIPT: python synchrony_analysis/voxel_based_analysis_v3.py
+
+NULL DISTRIBUTION APPROACH:
+  • Between-subject mismatch
+  • Pair each subject's brain with OTHER subjects' gastric signals
+  • Ensures true independence
+  • Generates N-1 null samples (where N = number of subjects)
+
+WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  A. LOAD ALL SUBJECTS' DATA                                            │
+│  ├─ Iterate through metadata (e.g., 10 subject-run pairs)             │
+│  ├─ For each subject-run:                                             │
+│  │   ├─ Load gastric signal                                           │
+│  │   ├─ Load brain signal                                             │
+│  │   ├─ Load mask                                                      │
+│  │   └─ Load fMRI reference                                           │
+│  └─ Store all data in memory                                          │
+│                                                                         │
+│  B. COMPUTE EMPIRICAL SYNCHRONY (ALL SUBJECTS)                          │
+│  ├─ For each subject-run:                                             │
+│  │   ├─ Calculate PLV (same as V2)                                    │
+│  │   ├─ Calculate awPLV (same as V2)                                  │
+│  │   └─ Store empirical results                                       │
+│  └─ Result: Empirical PLV & awPLV for all subject-runs                │
+│                                                                         │
+│  C. COMPUTE NULL DISTRIBUTION (MISMATCH APPROACH)                       │
+│  ├─ For each subject S (e.g., subject 1):                            │
+│  │   ├─ Get subject S's brain signal                                 │
+│  │   │                                                                 │
+│  │   ├─ For each OTHER subject S' (subjects 2-10):                   │
+│  │   │   ├─ Get subject S' gastric signal                            │
+│  │   │   ├─ Compute PLV_null = PLV(brain_S, gastric_S')             │
+│  │   │   └─ Compute awPLV_null = awPLV(brain_S, gastric_S')         │
+│  │   │                                                                 │
+│  │   ├─ Result: 9 null samples (for 10 subjects total)               │
+│  │   │   Null distributions: [N_voxels × 9]                          │
+│  │   │                                                                 │
+│  │   ├─ Calculate p-values per voxel:                                │
+│  │   │   p = (# null ≥ empirical) / 9                                │
+│  │   │                                                                 │
+│  │   └─ Apply multiple comparison correction:                         │
+│  │       ├─ FDR (Benjamini-Hochberg): q-values                       │
+│  │       └─ Bonferroni: α = 0.05 / N_voxels                          │
+│  │                                                                     │
+│  └─ Repeat for all subjects                                           │
+│                                                                         │
+│  D. STATISTICAL CORRECTIONS                                             │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ FDR CORRECTION (Benjamini-Hochberg):                            │   │
+│  │ 1. Sort all voxel p-values: p(1) ≤ p(2) ≤ ... ≤ p(N)          │   │
+│  │ 2. Find largest k where: p(k) ≤ k/N × α                        │   │
+│  │ 3. Reject H0 for voxels 1 to k                                 │   │
+│  │ 4. Compute q-values (adjusted p-values)                         │   │
+│  │                                                                  │   │
+│  │ Implementation:                                                  │   │
+│  │   from scipy.stats import false_discovery_control               │   │
+│  │   p_fdr = false_discovery_control(p_values, method='bh')        │   │
+│  │   sig_fdr = p_fdr < 0.05                                        │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ BONFERRONI CORRECTION:                                          │   │
+│  │ Very conservative correction for family-wise error rate         │   │
+│  │                                                                  │   │
+│  │ bonferroni_alpha = 0.05 / N_voxels                              │   │
+│  │ Example: 0.05 / 270,000 = 1.85e-7                               │   │
+│  │                                                                  │   │
+│  │ sig_bonferroni = p_values < bonferroni_alpha                    │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  E. SAVE OUTPUTS                                                        │
+│  ├─ NIfTI Maps (per subject-run):                                     │
+│  │   Same 8 maps as V2                                                │
+│  │                                                                     │
+│  ├─ CSV Statistics:                                                    │
+│  │   derivatives/brain_gast_voxel_analysis_v3/                        │
+│  │   individual_level_statistics.csv                                  │
+│  │   Columns:                                                          │
+│  │   ├─ subject, run                                                  │
+│  │   ├─ plv_empirical, plv_null_median, plv_null_mean, plv_null_std  │
+│  │   ├─ plv_median, plv_std                                           │
+│  │   ├─ awplv_empirical, awplv_null_*, awplv_median, awplv_std       │
+│  │   ├─ n_sig_voxels_uncorrected_plv, n_sig_voxels_uncorrected_awplv │
+│  │   ├─ n_sig_voxels_fdr_plv, n_sig_voxels_fdr_awplv                 │
+│  │   ├─ n_sig_voxels_bonferroni_plv, n_sig_voxels_bonferroni_awplv   │
+│  │   ├─ n_voxels, n_null_subjects, bonferroni_alpha                  │
+│  │   └─ Total: 23 columns per subject-run                            │
+│  │                                                                     │
+│  └─ Summary Plots:                                                     │
+│      plots/brain_gast_voxel_v3/individual_level_summary.png           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+OUTPUT EXAMPLE (10 subjects):
+┌─────────┬─────┬───────────┬───────────┬─────────────┬─────────────┐
+│ Subject │ Run │ PLV mean  │ awPLV mean│ FDR sig PLV │ FDR sig awPLV│
+├─────────┼─────┼───────────┼───────────┼─────────────┼─────────────┤
+│ LA      │ 1   │ 0.153     │ 0.222     │ 28,397      │ 26,548      │
+│ LA      │ 2   │ 0.147     │ 0.228     │ 32,437      │ 44,253      │
+│ BS      │ 1   │ 0.151     │ 0.221     │ 24,318      │ 26,196      │
+│ AE      │ 1   │ 0.199     │ 0.272     │ 45,357      │ 30,625      │
+│ ...     │ ... │ ...       │ ...       │ ...         │ ...         │
+└─────────┴─────┴───────────┴───────────┴─────────────┴─────────────┘
+
+ADVANTAGES OF V3:
+  ✓ Truly independent null samples
+  ✓ Population-level inference possible
+  ✓ More conservative null distribution
+  ✓ Built-in multiple comparison correction
+  ✓ Comprehensive statistical output
+
+LIMITATIONS OF V3:
+  ⚠ Smaller null sample size (N-1, typically 7-9)
+  ⚠ Assumes between-subject gastric signals are independent
+  ⚠ Computationally more expensive (all pairwise comparisons)
+
+================================================================================
+        STEP 4: GROUP-LEVEL ANALYSIS (voxel_based_second_level_v2.py)
+================================================================================
+
+PURPOSE: Population-level statistical testing using FSL Randomise
+
+SCRIPT: python synchrony_analysis/voxel_based_second_level_v2.py [options]
+
+COMMAND-LINE OPTIONS:
+  --metadata <file>          Metadata CSV (default: egg_brain_meta_data_10subjects.csv)
+  --include-awplv           Include awPLV in analysis (default: True)
+  --no-include-awplv        Exclude awPLV (PLV only)
+
+EXAMPLES:
+  # Default: 10 subjects, both PLV and awPLV
+  python synchrony_analysis/voxel_based_second_level_v2.py
+
+  # Full dataset
+  python synchrony_analysis/voxel_based_second_level_v2.py --metadata dataframes/egg_brain_meta_data.csv
+
+  # PLV only
+  python synchrony_analysis/voxel_based_second_level_v2.py --no-include-awplv
+
+WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  A. LOAD METADATA AND CONFIGURE                                        │
+│  ├─ Read metadata CSV                                                  │
+│  ├─ Identify unique subjects and their runs                           │
+│  ├─ Determine measures to process:                                    │
+│  │   ├─ PLV: plv_delta, plv_permut_median, plvs_empirical           │
+│  │   └─ awPLV: awplv_delta, awplv_permut_median, awplvs_empirical   │
+│  └─ Set FSL_DIR environment variable                                  │
+│                                                                         │
+│  B. COMPUTE WITHIN-SUBJECT AVERAGES                                    │
+│  ├─ For each subject with multiple runs:                             │
+│  │   ├─ Load all runs for this subject                               │
+│  │   ├─ Average across runs (mean over run dimension)                │
+│  │   ├─ Apply MNI brain mask (zero out-of-brain voxels)             │
+│  │   └─ Save subject-level average map                               │
+│  │                                                                     │
+│  ├─ Output:                                                            │
+│  │   derivatives/brain_gast/{subject}/                                │
+│  │   {measure}_{subject}_mean_runs{clean_level}.nii.gz               │
+│  │                                                                     │
+│  └─ Example:                                                           │
+│      Subject AE with 3 runs → single averaged PLV map                 │
+│                                                                         │
+│  C. COMPUTE ACROSS-SUBJECT AVERAGE                                     │
+│  ├─ For each measure:                                                 │
+│  │   ├─ Load all subjects' average maps                              │
+│  │   ├─ Average across subjects (grand mean)                         │
+│  │   └─ Save group-level average map                                 │
+│  │                                                                     │
+│  └─ Output:                                                            │
+│      derivatives/brain_gast/                                           │
+│      {measure}_mean_subjects{clean_level}.nii.gz                       │
+│                                                                         │
+│  D. PREPARE FSL RANDOMISE INPUTS                                        │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ DESIGN MATRIX (Paired t-test):                                  │   │
+│  │                                                                  │   │
+│  │ For N subjects comparing empirical vs null:                     │   │
+│  │                                                                  │   │
+│  │        EV1  EV2  EV3  ...  EV_N+1                               │   │
+│  │ Sub1    1    1    0   ...    0       ← Empirical                │   │
+│  │ Sub2    1    0    1   ...    0       ← Empirical                │   │
+│  │ ...    ...  ...  ...  ...   ...                                 │   │
+│  │ SubN    1    0    0   ...    1       ← Empirical                │   │
+│  │ Sub1   -1    1    0   ...    0       ← Null                     │   │
+│  │ Sub2   -1    0    1   ...    0       ← Null                     │   │
+│  │ ...    ...  ...  ...  ...   ...                                 │   │
+│  │ SubN   -1    0    0   ...    1       ← Null                     │   │
+│  │                                                                  │   │
+│  │ EV1: Main effect (empirical - null)                             │   │
+│  │ EV2-EV_N+1: Subject-specific intercepts                         │   │
+│  │                                                                  │   │
+│  │ Saved as: fsl_randomize/design.mat                              │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ CONTRAST VECTOR:                                                │   │
+│  │ [1  0  0  ...  0]                                               │   │
+│  │  ↑                                                               │   │
+│  │  Test main effect of empirical > null                           │   │
+│  │                                                                  │   │
+│  │ Saved as: fsl_randomize/design.con                              │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ EXCHANGE BLOCK LABELS:                                          │   │
+│  │ [1  2  3  ...  N  1  2  3  ...  N]                             │   │
+│  │  ↑              ↑  ↑              ↑                              │   │
+│  │  Empirical runs   Null runs (same subjects)                     │   │
+│  │                                                                  │   │
+│  │ Defines subject pairing for permutation testing                 │   │
+│  │                                                                  │   │
+│  │ Saved as: fsl_randomize/design.grp                              │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ 4D DATA FILES:                                                  │   │
+│  │                                                                  │   │
+│  │ Concatenate subject maps into 4D volumes:                       │   │
+│  │                                                                  │   │
+│  │ For PLV:                                                         │   │
+│  │   4d_plv.nii.gz = [plvs_empirical_all_subjects,                │   │
+│  │                     plv_permut_median_all_subjects]             │   │
+│  │   Shape: (X, Y, Z, 2N) where N = number of subjects            │   │
+│  │                                                                  │   │
+│  │ For awPLV:                                                       │   │
+│  │   4d_awplv.nii.gz = [awplvs_empirical_all_subjects,            │   │
+│  │                       awplv_permut_median_all_subjects]         │   │
+│  │                                                                  │   │
+│  │ Saved in: fsl_randomize/                                        │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  E. RUN FSL RANDOMISE                                                  │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ FSL RANDOMISE PARAMETERS:                                       │   │
+│  │                                                                  │   │
+│  │ Method: Permutation-based inference                             │   │
+│  │ Number of permutations: 10,000                                  │   │
+│  │                                                                  │   │
+│  │ Correction methods:                                             │   │
+│  │ ├─ Voxel-wise p-values (uncorrected)                           │   │
+│  │ ├─ Cluster-based correction                                     │   │
+│  │ │   ├─ Cluster-forming threshold: t > 2.3                       │   │
+│  │ │   └─ Cluster mass threshold: 2.3                              │   │
+│  │ └─ TFCE (Threshold-Free Cluster Enhancement)                    │   │
+│  │     └─ Combines voxel intensity and spatial extent              │   │
+│  │                                                                  │   │
+│  │ Command for PLV:                                                │   │
+│  │   randomise -i 4d_plv.nii.gz \                                  │   │
+│  │             -o result_plv_strict_ \                             │   │
+│  │             -d design.mat \                                      │   │
+│  │             -t design.con \                                      │   │
+│  │             -e design.grp \                                      │   │
+│  │             -m mask.nii.gz \                                     │   │
+│  │             -n 10000 \                                           │   │
+│  │             -T --uncorrp -c 2.3 -C 2.3 --tfce                   │   │
+│  │                                                                  │   │
+│  │ Command for awPLV: (same, different input/output)               │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  F. OUTPUTS (PER MEASURE TYPE)                                         │
+│  ├─ fsl_randomize/result_plv_strict_*                                 │
+│  │   ├─ *_tstat1.nii.gz          T-statistic map                      │
+│  │   ├─ *_tfce_corrp_tstat1.nii.gz  TFCE corrected p-values (1-p)    │
+│  │   ├─ *_vox_p_tstat1.nii.gz    Voxel-wise p-values                 │
+│  │   ├─ *_clustere_corrp_tstat1.nii.gz  Cluster extent corrected p   │
+│  │   └─ *_clusterm_corrp_tstat1.nii.gz  Cluster mass corrected p     │
+│  │                                                                     │
+│  └─ fsl_randomize/result_awplv_strict_*                               │
+│      (same files as above for awPLV)                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+INTERPRETATION OF FSL RANDOMISE OUTPUTS:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ *_tstat1.nii.gz:                                                       │
+│   T-statistic at each voxel testing empirical > null                  │
+│   Positive values: empirical synchrony exceeds null                   │
+│   Negative values: empirical synchrony below null                     │
+│                                                                         │
+│ *_tfce_corrp_tstat1.nii.gz:                                           │
+│   TFCE-corrected p-values (stored as 1-p)                             │
+│   Values > 0.95 → p < 0.05 (significant)                              │
+│   TFCE recommended for neuroimaging (Smith & Nichols, 2009)           │
+│                                                                         │
+│ *_vox_p_tstat1.nii.gz:                                                │
+│   Uncorrected voxel-wise p-values (1-p)                               │
+│   For exploratory analysis only                                       │
+│                                                                         │
+│ Cluster-corrected maps:                                               │
+│   Cluster extent: based on cluster size (voxel count)                 │
+│   Cluster mass: based on sum of t-values within cluster               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+RUNTIME:
+  • Averaging: ~1-5 minutes
+  • FSL Randomise (10,000 perm): ~30-60 minutes per measure
+  • Total for PLV + awPLV: ~1-2 hours
+
+================================================================================
+                         COMPLETE PIPELINE EXECUTION
+================================================================================
+
+SCENARIO 1: SINGLE SUBJECT ANALYSIS (V2)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ # Setup                                                                 │
+│ conda activate brain_gut                                                │
+│ export FSL_DIR=/usr/local/fsl                                          │
+│ cd main_project_path/code                                              │
+│                                                                         │
+│ # Process one subject                                                   │
+│ SUBJECT=AE                                                              │
+│ RUN=1                                                                   │
+│                                                                         │
+│ python synchrony_analysis/prepare_afni_data.py $SUBJECT $RUN           │
+│ python synchrony_analysis/signal_slicing_v2.py $SUBJECT $RUN           │
+│ python synchrony_analysis/voxel_based_analysis_v2.py $SUBJECT $RUN     │
+│                                                                         │
+│ # Check outputs                                                         │
+│ ls ../derivatives/brain_gast/$SUBJECT/${SUBJECT}${RUN}/*.nii.gz        │
+│ ls ../plots/brain_gast/$SUBJECT/${SUBJECT}${RUN}/*.png                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Expected output for AE run 1:
+  PLV stats: mean=0.1991, std=0.1013
+  awPLV stats: mean=0.2718, std=0.1330
+  Saved 210 permutations for PLV and awPLV null distributions
+  8 NIfTI maps created (4 PLV + 4 awPLV)
+
+SCENARIO 2: BATCH PROCESSING ALL SUBJECTS (V2)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ # Process all subjects in metadata                                     │
+│ METADATA=dataframes/egg_brain_meta_data_10subjects.csv                 │
+│                                                                         │
+│ while IFS=, read -r subject run rest; do                               │
+│     if [ "$subject" != "subject" ]; then  # Skip header                │
+│         echo "Processing $subject run $run..."                         │
+│         python synchrony_analysis/prepare_afni_data.py $subject $run   │
+│         python synchrony_analysis/signal_slicing_v2.py $subject $run   │
+│         python synchrony_analysis/voxel_based_analysis_v2.py $subject $run │
+│     fi                                                                  │
+│ done < $METADATA                                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+SCENARIO 3: FULL PIPELINE WITH GROUP ANALYSIS (V2 + Group)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ # Step 1: Individual-level analysis (all subjects)                     │
+│ # (Use batch script from Scenario 2)                                   │
+│                                                                         │
+│ # Step 2: Group-level analysis                                         │
+│ python synchrony_analysis/voxel_based_second_level_v2.py \             │
+│     --metadata dataframes/egg_brain_meta_data_10subjects.csv           │
+│                                                                         │
+│ # Step 3: Check group results                                          │
+│ ls ../derivatives/brain_gast/fsl_randomize/result_*.nii.gz             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+SCENARIO 4: V3 ANALYSIS (POPULATION-LEVEL INFERENCE)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ # Ensure all subjects preprocessed (Steps 1-2 from Scenario 2)         │
+│                                                                         │
+│ # Run V3 analysis (processes all subjects automatically)               │
+│ python synchrony_analysis/voxel_based_analysis_v3.py                   │
+│                                                                         │
+│ # Check outputs                                                         │
+│ cat ../derivatives/brain_gast_voxel_analysis_v3/individual_level_statistics.csv │
+│ ls ../derivatives/brain_gast_voxel_analysis_v3/{subject}/*.nii.gz      │
+│ ls ../plots/brain_gast_voxel_v3/*.png                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+                            OUTPUT INTERPRETATION
+================================================================================
+
+INDIVIDUAL-LEVEL MAPS (V2 and V3):
+
+plvs_empirical / awplvs_empirical:
+  • Range: [0, 1]
+  • Interpretation: Observed phase synchrony
+  • Typical values: 0.10-0.30 (higher = stronger synchrony)
+  • Hot spots: Insular cortex, ACC, somatosensory areas
+
+plv_p_vals / awplv_p_vals:
+  • Range: [0, 1]
+  • Interpretation: Uncorrected p-value (probability under null)
+  • p < 0.05: Nominally significant
+  • Use with caution (no multiple comparison correction)
+
+plv_delta / awplv_delta:
+  • Interpretation: Effect size (empirical - null median)
+  • Positive values: Above-chance synchrony
+  • Typical range: 0.01-0.10
+  • Values > 0.05 indicate moderate to strong coupling
+
+plv_permut_median / awplv_permut_median:
+  • Interpretation: Expected synchrony under null hypothesis
+  • Baseline for comparison with empirical
+  • Typical range: 0.10-0.20
+
+V3 STATISTICS CSV:
+
+Key columns for interpretation:
+  • plv_empirical: Mean PLV across all brain voxels
+  • n_sig_voxels_fdr_plv: Number of voxels significant after FDR correction
+  • n_sig_voxels_bonferroni_plv: Number passing Bonferroni (most robust)
+  • bonferroni_alpha: Significance threshold (typically ~1.8e-7)
+
+Example interpretation:
+  Subject AE run 1:
+    • Mean PLV: 0.199 (above typical 0.15)
+    • FDR sig voxels: 45,357 out of 272,500 (16.6%)
+    • Bonferroni sig: likely < 1% (most stringent effects)
+    → Strong gastric-brain coupling, spatially extensive
+
+GROUP-LEVEL MAPS (FSL Randomise):
+
+*_tfce_corrp_tstat1.nii.gz (RECOMMENDED):
+  • Threshold at 0.95 (equivalent to p < 0.05)
+  • Voxels with value > 0.95 show significant empirical > null
+  • TFCE balances voxel intensity and spatial extent
+  • Well-suited for neuroimaging data
+
+Visualization:
+  fsleyes result_plv_strict_tfce_corrp_tstat1.nii.gz \
+      -cm red-yellow -dr 0.95 1.0
+
+Expected patterns:
+  • Significant clusters in insula, anterior cingulate
+  • Potentially somatosensory cortex, thalamus
+  • awPLV may show larger/more clusters than PLV
+
+================================================================================
+                        QUALITY CONTROL CHECKS
+================================================================================
+
+1. INDIVIDUAL-LEVEL (V2/V3):
+
+□ Data loading successful:
+  ✓ Gastric signal: non-zero, no NaNs
+  ✓ Brain signal: N_voxels > 200,000, no NaNs
+  ✓ Mask: matches brain signal dimensions
+
+□ Empirical PLV in expected range:
+  ✓ Mean PLV: 0.10-0.30 (typical)
+  ✓ Std PLV: 0.05-0.15
+  ⚠ Mean < 0.05 or > 0.50: check filtering
+
+□ awPLV higher than PLV:
+  ✓ Mean awPLV typically 1.2-1.5× mean PLV
+  ⚠ awPLV < PLV: implementation error
+
+□ Null distribution reasonable:
+  ✓ V2: ~200-300 permutations
+  ✓ V3: N-1 null samples (7-9 for 10 subjects)
+  ✓ Null median < empirical (for most voxels)
+
+□ Output files created:
+  ✓ 8 NIfTI maps per subject-run
+  ✓ V3: CSV with statistics
+
+2. GROUP-LEVEL:
+
+□ Subject averaging:
+  ✓ Mean maps created for all subjects
+  ✓ No subjects with all-zero maps
+
+□ FSL Randomise:
+  ✓ Completed without errors
+  ✓ Output files have expected naming
+  ✓ TFCE map has values in [0, 1] range
+
+□ Significance patterns:
+  ✓ Clusters in plausible brain regions
+  ⚠ No significant voxels: underpowered or true null
+  ⚠ Whole-brain significant: likely artifact
+
+3. CROSS-VALIDATION:
+
+□ V2 vs V3 comparison:
+  ✓ Similar spatial patterns of high PLV
+  ✓ V3 typically more conservative (fewer sig voxels)
+
+□ PLV vs awPLV comparison:
+  ✓ High correlation (r > 0.7)
+  ✓ awPLV may show stronger effects in some regions
+
+================================================================================
+                            TROUBLESHOOTING
+================================================================================
+
+PROBLEM: "FileNotFoundError: AFNI data not found"
+SOLUTION:
+  1. Check AFNI data location:
+     ls main_project_path/BIDS_data/soroka/sub-{subject}/pb05*.nii.gz
+  2. Update path in prepare_afni_data.py if needed
+  3. Ensure subject name matches exactly (case-sensitive)
+
+PROBLEM: "ValueError: Dimension mismatch in mask"
+SOLUTION:
+  1. Re-run prepare_afni_data.py to regenerate mask
+  2. Mask must match filtered brain signal dimensions
+  3. Check that same clean_level used throughout
+
+PROBLEM: "Very high PLV values (>0.7) everywhere"
+CAUSE: Filtering artifact or incorrect phase extraction
+SOLUTION:
+  1. Verify gastric peak frequency is correct (~0.05 Hz)
+  2. Check bandpass filter parameters in config.py
+  3. Ensure signals are properly resampled
+
+PROBLEM: "All p-values = 1.0"
+CAUSE: Empirical PLV < all null samples (unlikely pattern)
+SOLUTION:
+  1. Check if gastric signal is flat (std ≈ 0)
+  2. Verify brain signal has variability
+  3. Examine signals visually
+
+PROBLEM: "FSL Randomise fails to run"
+CAUSE: FSL not installed or FSL_DIR not set
+SOLUTION:
+  1. export FSL_DIR=/usr/local/fsl
+  2. Check FSL installation: which randomise
+  3. Verify design matrices created correctly
+
+PROBLEM: "No significant voxels after FDR correction"
+INTERPRETATION:
+  • May indicate weak or absent gastric-brain coupling
+  • Check effect sizes (delta maps) - modest effects may not survive correction
+  • Consider using V3 for more power if V2 shows weak effects
+
+================================================================================
+                         COMPARISON: V2 vs V3
+================================================================================
+
+┌────────────────────┬───────────────────────┬───────────────────────────┐
+│ Aspect             │ V2 (Temporal Perm)    │ V3 (Mismatch)             │
+├────────────────────┼───────────────────────┼───────────────────────────┤
+│ Null Distribution  │ Circular rolling      │ Between-subject pairing   │
+│ Independence       │ Assumes 1-min shift   │ True independence         │
+│ Null Sample Size   │ ~200-300 per subject  │ N-1 (7-9 for 10 subjects) │
+│ Subject-specific   │ Yes                   │ Yes                       │
+│ Population Inf.    │ No (need group level) │ Yes (built-in)            │
+│ Correction         │ Manual (external)     │ FDR & Bonferroni          │
+│ Computational Cost │ Moderate              │ Higher (all pairs)        │
+│ Recommended For    │ Individual variability│ Population effects        │
+│ Statistical Power  │ Higher (more nulls)   │ Lower (fewer nulls)       │
+│ Conservativeness   │ Moderate              │ More conservative         │
+└────────────────────┴───────────────────────┴───────────────────────────┘
+
+RECOMMENDATION:
+  • Run BOTH V2 and V3 for comprehensive analysis
+  • V2: Explore individual subject patterns, generate maps for visualization
+  • V3: Confirm population-level effects with rigorous correction
+  • Use V2 → Group analysis for final publication figures
+
+================================================================================
+                              KEY REFERENCES
+================================================================================
+
+SYNCHRONY METHODS:
+  • Lachaux et al. (1999). Measuring phase synchrony in brain signals.
+    Human Brain Mapping, 8(4), 194-208.
+    → Original PLV method
+
+  • Cohen (2014). Analyzing Neural Time Series Data: Theory and Practice.
+    MIT Press.
+    → awPLV and practical implementation
+
+NULL DISTRIBUTIONS:
+  • Maris & Oostenveld (2007). Nonparametric statistical testing of
+    EEG- and MEG-data. Journal of Neuroscience Methods, 164(1), 177-190.
+    → Permutation testing framework
+
+MULTIPLE COMPARISON CORRECTION:
+  • Benjamini & Hochberg (1995). Controlling the false discovery rate.
+    JRSS Series B, 57(1), 289-300.
+    → FDR correction
+
+  • Genovese et al. (2002). Thresholding of statistical maps using FDR.
+    NeuroImage, 15(4), 870-878.
+    → FDR in neuroimaging
+
+FSL RANDOMISE:
+  • Winkler et al. (2014). Permutation inference for GLM.
+    NeuroImage, 92, 381-397.
+    → FSL Randomise implementation
+
+  • Smith & Nichols (2009). Threshold-free cluster enhancement.
+    NeuroImage, 44(1), 83-98.
+    → TFCE methodology
+
+GASTRIC-BRAIN COUPLING:
+  • Richter et al. (2017). Phase-amplitude coupling between gastric and
+    cortical oscillations. Cerebral Cortex, 27(3), 1638-1647.
+    → Gastric rhythm and brain activity
+
+================================================================================
+                            FINAL CHECKLIST
+================================================================================
+
+Before publication, ensure:
+
+□ DATA PROCESSING
+  ✓ All subjects preprocessed with consistent parameters
+  ✓ Same clean_level used throughout
+  ✓ Gastric peak frequencies verified
+  ✓ Visual QC of all outputs
+
+□ STATISTICAL ANALYSIS
+  ✓ Ran both V2 and V3 for comparison
+  ✓ Applied appropriate multiple comparison corrections
+  ✓ Group-level analysis completed
+  ✓ Results consistent across approaches
+
+□ QUALITY CONTROL
+  ✓ No subjects with all-zero or all-NaN maps
+  ✓ PLV values in plausible range (0.1-0.3)
+  ✓ awPLV > PLV for most voxels
+  ✓ Null distributions reasonable
+
+□ DOCUMENTATION
+  ✓ Record exact software versions
+  ✓ Save all parameter settings
+  ✓ Document any excluded subjects/runs
+  ✓ Archive analysis scripts
+
+□ OUTPUTS
+  ✓ Individual maps saved for all subjects
+  ✓ Group-level statistical maps created
+  ✓ Summary CSV files generated
+  ✓ Visualization plots created
+
+================================================================================
+                              END OF FLOWCHART
+================================================================================
+
+For questions or issues, refer to:
+  • README.md (project root)
+  • check_preprocessing_status.py (verify data completeness)
+
+Last updated: December 19, 2024
+Pipeline version: 2.0 (Brain-Gastric Synchrony)

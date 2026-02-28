@@ -1,0 +1,889 @@
+================================================================================
+    GASTRIC-BRAIN SYNCHRONY: STEPWISE PIPELINE FLOWCHART (V3 - STREAMLINED)
+================================================================================
+
+Version: 3.0
+Date: December 19, 2024
+Focus: Linear workflow from raw data → PLV/awPLV calculation
+
+================================================================================
+                                   OVERVIEW
+================================================================================
+
+This flowchart describes the complete pipeline for computing voxel-wise
+gastric-brain phase synchronization, from raw AFNI/fMRI data to final
+statistical maps.
+
+INPUTS:
+  • AFNI preprocessed fMRI (MNI space, 2mm, TR=2s)
+  • Preprocessed gastric EGG signals (10 Hz)
+  • Subject metadata CSV
+
+OUTPUTS:
+  • PLV and awPLV maps per subject (8 NIfTI files)
+  • Statistical maps (p-values, effect sizes)
+  • Group-level FSL Randomise results
+  • Summary statistics (CSV)
+
+PIPELINE STAGES:
+  [Raw Data] → [1: Prepare] → [2: Slice] → [3: Analyze] → [4: Group] → [Results]
+
+================================================================================
+                         STAGE 0: ENVIRONMENT & DATA SETUP
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ CONDA ENVIRONMENT:                                                      │
+│   conda activate brain_gut                                              │
+│                                                                         │
+│ SYSTEM ENVIRONMENT:                                                     │
+│   export FSL_DIR=/usr/local/fsl                                        │
+│   cd main_project_path/code                                            │
+│                                                                         │
+│ PYTHON PACKAGES REQUIRED:                                              │
+│   • Core: numpy, pandas, scipy                                         │
+│   • Imaging: nibabel, nilearn, nipype                                  │
+│   • Signal: mne (for filtering)                                        │
+│   • Stats: scikit-learn                                                │
+│   • Viz: matplotlib, seaborn                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+DATA STRUCTURE (per subject-run):
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ INPUT DATA LOCATIONS:                                                   │
+│                                                                         │
+│ 1. AFNI Preprocessed Brain:                                            │
+│    Path: BIDS_data/soroka/sub-{subject}/                              │
+│    Files (try in order):                                               │
+│      • pb05.sub-{subject}.r0{run}.scale.nii.gz    [scaled]            │
+│      • pb04.sub-{subject}.r0{run}.blur.nii.gz     [smoothed]          │
+│      • pb03.sub-{subject}.r0{run}.volreg.nii.gz   [motion corrected]  │
+│      • errts.sub-{subject}.r0{run}.*.nii.gz       [residuals]         │
+│    Format: 4D NIfTI (X, Y, Z, Time)                                    │
+│    Space: MNI152, 2mm isotropic                                        │
+│    TR: 2s (0.5 Hz sampling)                                            │
+│                                                                         │
+│ 2. Gastric Signal:                                                      │
+│    Path: derivatives/brain_gast/{subject}/{subject}{run}/             │
+│    File: gast_data_{subject}_run{run}strict.npy                       │
+│    Format: 1D NumPy array                                              │
+│    Sampling: 10 Hz                                                     │
+│    Preprocessing: Bandpass filtered 0.02-0.08 Hz                       │
+│                                                                         │
+│ 3. Gastric Peak Frequency:                                             │
+│    Path: Same as gastric signal                                        │
+│    File: max_freq{subject}_run{run}strict.npy                         │
+│    Content: Single float (Hz), typically 0.033-0.067 Hz                │
+│                                                                         │
+│ 4. Metadata:                                                            │
+│    File: dataframes/egg_brain_meta_data_10subjects.csv                 │
+│    Columns: subject, run, trigger_start, mri_length, ...               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+CONFIG PARAMETERS (config.py):
+┌─────────────────────────────────────────────────────────────────────────┐
+│ sample_rate_fmri = 0.5          # Hz (TR = 2s)                         │
+│ intermediate_sample_rate = 10    # Hz (gastric resampling)             │
+│ clean_level = 'strict'          # Data cleaning level                  │
+│ bandpass_lim = 0.015            # Hz (frequency bandwidth)             │
+│ main_project_path = "/path/to/project/"                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+              STAGE 1: DATA PREPARATION (prepare_afni_data.py)
+================================================================================
+
+COMMAND:
+  python synchrony_analysis/prepare_afni_data.py <subject> <run>
+
+PURPOSE:
+  Convert 4D AFNI fMRI → 2D voxel timeseries + mask
+
+DETAILED WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ STEP 1.1: LOAD AFNI DATA                                              │
+│ ─────────────────────────                                              │
+│   File: pb05.sub-{subject}.r0{run}.scale.nii.gz                       │
+│   Load: img = nib.load(afni_file)                                     │
+│   Data: fmri_data = img.get_fdata()                                   │
+│   Shape: (X, Y, Z, T) e.g., (91, 109, 91, 300)                        │
+│                                                                         │
+│ STEP 1.2: CREATE/LOAD BRAIN MASK                                      │
+│ ──────────────────────────────                                         │
+│   Method 1: Load existing mask from previous run                       │
+│     mask_file = 'derivatives/brain_gast/mask_*_strict.npz'            │
+│     mask = np.load(mask_file)['mask']                                 │
+│                                                                         │
+│   Method 2: Create whole-brain mask                                    │
+│     mean_img = np.mean(fmri_data, axis=3)                             │
+│     threshold = np.percentile(mean_img[mean_img > 0], 10)             │
+│     mask = mean_img > threshold                                        │
+│                                                                         │
+│   Mask shape: (X, Y, Z) boolean array                                  │
+│   Typical: ~250,000-280,000 True voxels (in-brain)                    │
+│                                                                         │
+│ STEP 1.3: EXTRACT VOXEL TIMESERIES                                    │
+│ ────────────────────────────────                                       │
+│   Reshape 4D → 2D:                                                     │
+│     n_voxels = np.sum(mask)                                            │
+│     n_timepoints = fmri_data.shape[3]                                  │
+│                                                                         │
+│     brain_signal = np.zeros((n_voxels, n_timepoints))                  │
+│     for t in range(n_timepoints):                                      │
+│         brain_signal[:, t] = fmri_data[:, :, :, t][mask]              │
+│                                                                         │
+│   Result shape: (N_voxels, N_time)                                     │
+│   Example: (272500, 300) for 10-minute scan                            │
+│                                                                         │
+│ STEP 1.4: BANDPASS FILTER (GASTRIC RANGE)                             │
+│ ───────────────────────────────────────                                │
+│   Filter parameters:                                                    │
+│     low_freq = 0.02 Hz                                                 │
+│     high_freq = 0.08 Hz                                                │
+│     filter_order = 3                                                   │
+│                                                                         │
+│   Apply MNE FIR filter:                                                │
+│     from mne.filter import filter_data                                 │
+│     brain_filtered = filter_data(                                      │
+│         brain_signal,                                                  │
+│         sfreq=sample_rate_fmri,                                        │
+│         l_freq=0.02,                                                   │
+│         h_freq=0.08,                                                   │
+│         method='fir',                                                  │
+│         fir_window='hamming'                                           │
+│     )                                                                  │
+│                                                                         │
+│ STEP 1.5: SAVE OUTPUTS                                                │
+│ ────────────────────                                                   │
+│   Output directory:                                                     │
+│     derivatives/brain_gast/{subject}/{subject}{run}/                  │
+│                                                                         │
+│   Files created:                                                        │
+│     1. func_filtered_*_sliced.npz                                      │
+│        Content: {'brain_signal': brain_filtered}                       │
+│        Shape: (N_voxels, N_time)                                       │
+│        Dtype: float32                                                  │
+│                                                                         │
+│     2. mask_*_strict.npz                                               │
+│        Content: {'mask': mask}                                         │
+│        Shape: (X, Y, Z)                                                │
+│        Dtype: bool                                                     │
+│                                                                         │
+│     3. Symlink to original fMRI                                        │
+│        {subject}_*_bold_strict.nii.gz → original AFNI file            │
+│                                                                         │
+│   Symlink at root:                                                      │
+│     derivatives/brain_gast/mask_*_strict.npz → subject mask           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+OUTPUT SUMMARY:
+  ✓ Brain signal: (N_voxels, N_time) filtered to gastric range
+  ✓ Mask: (X, Y, Z) boolean array for NIfTI reconstruction
+  ✓ Ready for temporal alignment in Stage 2
+
+================================================================================
+            STAGE 2: TEMPORAL ALIGNMENT (signal_slicing_v2.py)
+================================================================================
+
+COMMAND:
+  python synchrony_analysis/signal_slicing_v2.py <subject> <run>
+
+PURPOSE:
+  Ensure gastric and brain signals cover identical time period
+
+DETAILED WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ STEP 2.1: LOAD SIGNALS                                                │
+│ ────────────────────                                                   │
+│   Gastric:                                                              │
+│     gast_file = 'derivatives/.../gast_data_*_strict.npy'              │
+│     gastric_signal = np.load(gast_file)                               │
+│     Shape: (N_gastric,) at 10 Hz                                       │
+│     Example: (6000,) for 600s scan                                     │
+│                                                                         │
+│   Brain:                                                                │
+│     brain_file = 'derivatives/.../func_filtered_*_sliced.npz'         │
+│     brain_signal = np.load(brain_file)['brain_signal']                │
+│     Shape: (N_voxels, N_brain) at 0.5 Hz                               │
+│     Example: (272500, 300) for 600s scan                               │
+│                                                                         │
+│ STEP 2.2: CALCULATE EXPECTED DURATIONS                                │
+│ ────────────────────────────────────                                   │
+│   From metadata:                                                        │
+│     mri_length = 600  # seconds                                        │
+│     TR = 2.0  # seconds                                                │
+│                                                                         │
+│   Expected timepoints:                                                  │
+│     expected_brain_TRs = mri_length / TR = 300                         │
+│     expected_gastric_samples = mri_length * 10 = 6000                  │
+│                                                                         │
+│ STEP 2.3: HANDLE TRIGGER START                                        │
+│ ────────────────────────────                                           │
+│   If trigger_start == 'auto':                                          │
+│     Start from beginning (no offset)                                   │
+│                                                                         │
+│   If trigger_start is integer (e.g., 101):                            │
+│     gastric_offset = trigger_start samples                             │
+│     gastric_signal = gastric_signal[gastric_offset:]                  │
+│                                                                         │
+│ STEP 2.4: TEMPORAL SLICING                                            │
+│ ────────────────────────                                               │
+│   Slice gastric to expected duration:                                  │
+│     gastric_sliced = gastric_signal[:expected_gastric_samples]        │
+│                                                                         │
+│   Slice brain to expected duration:                                    │
+│     brain_sliced = brain_signal[:, :expected_brain_TRs]               │
+│                                                                         │
+│   Verify alignment:                                                     │
+│     gastric_duration = len(gastric_sliced) / 10  # seconds            │
+│     brain_duration = brain_sliced.shape[1] * 2   # seconds            │
+│     assert abs(gastric_duration - brain_duration) < 1.0               │
+│                                                                         │
+│ STEP 2.5: SAVE SYNCHRONIZED SIGNALS                                   │
+│ ─────────────────────────────────                                      │
+│   Gastric output:                                                       │
+│     File: gast_data_{subject}_run{run}strict_sliced.npy              │
+│     Shape: (N_gastric,) exactly matching scan duration                 │
+│     np.save(output_file, gastric_sliced)                               │
+│                                                                         │
+│   Brain output:                                                         │
+│     File: func_filtered_{subject}_run{run}strict_sliced.npz          │
+│     Content: {'brain_signal': brain_sliced}                            │
+│     Shape: (N_voxels, N_brain) exactly matching scan duration          │
+│     np.savez_compressed(output_file, brain_signal=brain_sliced)       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+TEMPORAL ALIGNMENT VERIFICATION:
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Example for 600s scan:                                                 │
+│   Gastric: 6000 samples / 10 Hz = 600.0 seconds                       │
+│   Brain:   300 TRs × 2s = 600.0 seconds                               │
+│   ✓ Aligned                                                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+OUTPUT SUMMARY:
+  ✓ Gastric signal: Temporally aligned, ready for phase extraction
+  ✓ Brain signal: Temporally aligned, ready for phase extraction
+  ✓ Both signals cover identical time period (different sampling rates)
+
+================================================================================
+    STAGE 3A: PLV/awPLV CALCULATION - V2 APPROACH (voxel_based_analysis_v2.py)
+================================================================================
+
+COMMAND:
+  python synchrony_analysis/voxel_based_analysis_v2.py <subject> <run>
+
+NULL DISTRIBUTION: Temporal permutation (circular rolling)
+
+DETAILED WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ STEP 3A.1: LOAD SYNCHRONIZED DATA                                     │
+│ ───────────────────────────────────                                    │
+│   gastric = np.load('gast_data_*_sliced.npy')                         │
+│   brain = np.load('func_filtered_*_sliced.npz')['brain_signal']       │
+│   mask = np.load('mask_*_strict.npz')['mask']                         │
+│   original_fmri = nib.load('*_bold_strict.nii.gz')                    │
+│                                                                         │
+│ STEP 3A.2: COMPUTE EMPIRICAL PLV                                      │
+│ ──────────────────────────────                                         │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ PHASE EXTRACTION (Hilbert Transform):                        │     │
+│   │                                                               │     │
+│   │ Brain phase:                                                  │     │
+│   │   from scipy.signal import hilbert                            │     │
+│   │   brain_analytic = hilbert(brain_signal, axis=1)             │     │
+│   │   brain_phase = np.angle(brain_analytic)                     │     │
+│   │   Shape: (N_voxels, N_time)                                  │     │
+│   │   Range: [-π, π] radians                                     │     │
+│   │                                                               │     │
+│   │ Gastric phase:                                                │     │
+│   │   from utils.gastric_utils import to_phase_resampled         │     │
+│   │   gastric_phase = to_phase_resampled(                        │     │
+│   │       gastric_signal,                                         │     │
+│   │       intermediate_sample_rate=10,                            │     │
+│   │       sample_rate_fmri=0.5                                    │     │
+│   │   )                                                           │     │
+│   │                                                               │     │
+│   │   Implementation of to_phase_resampled:                       │     │
+│   │     1. Hilbert transform: gastric_analytic = hilbert(gastric)│     │
+│   │     2. Extract phase: phase_10Hz = angle(gastric_analytic)   │     │
+│   │     3. Resample 10 Hz → 0.5 Hz using linear interpolation    │     │
+│   │     4. Return: gastric_phase_resampled                        │     │
+│   │   Shape: (N_time,)                                           │     │
+│   │   Range: [-π, π] radians                                     │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ PLV CALCULATION:                                             │     │
+│   │                                                               │     │
+│   │ Phase difference:                                             │     │
+│   │   phase_diff = brain_phase - gastric_phase[np.newaxis, :]    │     │
+│   │   Shape: (N_voxels, N_time)                                  │     │
+│   │                                                               │     │
+│   │ Complex exponential:                                          │     │
+│   │   complex_phase = np.exp(1j * phase_diff)                    │     │
+│   │   Shape: (N_voxels, N_time), dtype: complex128               │     │
+│   │                                                               │     │
+│   │ Temporal average:                                             │     │
+│   │   plv_complex = np.mean(complex_phase, axis=1)               │     │
+│   │   Shape: (N_voxels,), dtype: complex128                      │     │
+│   │                                                               │     │
+│   │ Magnitude (PLV):                                              │     │
+│   │   plv_empirical = np.abs(plv_complex)                        │     │
+│   │   Shape: (N_voxels,)                                         │     │
+│   │   Range: [0, 1] where:                                       │     │
+│   │     0 = no phase locking (random phases)                     │     │
+│   │     1 = perfect phase locking (constant phase difference)    │     │
+│   │                                                               │     │
+│   │ Typical values: mean ~ 0.15-0.20, std ~ 0.05-0.10           │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│ STEP 3A.3: COMPUTE EMPIRICAL awPLV                                    │
+│ ────────────────────────────────────                                   │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ AMPLITUDE EXTRACTION:                                         │     │
+│   │                                                               │     │
+│   │ Resample gastric to brain sampling rate:                     │     │
+│   │   from scipy.interpolate import interp1d                      │     │
+│   │   gastric_time_orig = np.arange(len(gastric)) / 10           │     │
+│   │   gastric_time_new = np.arange(N_time) / 0.5                │     │
+│   │   valid_idx = gastric_time_new <= gastric_time_orig[-1]     │     │
+│   │   interp = interp1d(gastric_time_orig, gastric,              │     │
+│   │                     kind='cubic', fill_value='extrapolate')  │     │
+│   │   gastric_resampled = interp(gastric_time_new[valid_idx])   │     │
+│   │                                                               │     │
+│   │ Match lengths:                                                │     │
+│   │   min_len = min(brain.shape[1], len(gastric_resampled))     │     │
+│   │   brain_matched = brain[:, :min_len]                         │     │
+│   │   gastric_matched = gastric_resampled[:min_len]             │     │
+│   │                                                               │     │
+│   │ Hilbert transform for amplitudes:                            │     │
+│   │   brain_analytic = hilbert(brain_matched, axis=1)           │     │
+│   │   gastric_analytic = hilbert(gastric_matched)               │     │
+│   │   brain_amp = np.abs(brain_analytic)                        │     │
+│   │   gastric_amp = np.abs(gastric_analytic)                    │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ AMPLITUDE WEIGHTING:                                          │     │
+│   │                                                               │     │
+│   │ Amplitude product (per voxel, per timepoint):                │     │
+│   │   amp_product = brain_amp * gastric_amp[np.newaxis, :]       │     │
+│   │   Shape: (N_voxels, N_time)                                  │     │
+│   │                                                               │     │
+│   │ Normalize to create weights:                                 │     │
+│   │   sum_amp = np.sum(amp_product, axis=1, keepdims=True)       │     │
+│   │   sum_amp[sum_amp == 0] = 1.0  # Avoid division by zero     │     │
+│   │   weights = amp_product / sum_amp                            │     │
+│   │   Shape: (N_voxels, N_time)                                  │     │
+│   │   Property: np.sum(weights, axis=1) ≈ 1.0 for each voxel    │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ awPLV CALCULATION:                                           │     │
+│   │                                                               │     │
+│   │ Phase difference:                                             │     │
+│   │   phase_diff = np.angle(brain_analytic) -                    │     │
+│   │                np.angle(gastric_analytic)[np.newaxis, :]     │     │
+│   │                                                               │     │
+│   │ Weighted complex average:                                     │     │
+│   │   awplv_complex = np.sum(weights * np.exp(1j * phase_diff),  │     │
+│   │                          axis=1)                              │     │
+│   │                                                               │     │
+│   │ Magnitude (awPLV):                                            │     │
+│   │   awplv_empirical = np.abs(awplv_complex)                    │     │
+│   │   Shape: (N_voxels,)                                         │     │
+│   │   Range: [0, 1]                                              │     │
+│   │                                                               │     │
+│   │ Typical values: mean ~ 0.22-0.28, std ~ 0.10-0.15           │     │
+│   │ Note: awPLV > PLV (emphasizes high-amplitude coupling)       │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│ STEP 3A.4: COMPUTE NULL DISTRIBUTION                                  │
+│ ──────────────────────────────────                                     │
+│                                                                         │
+│   Temporal permutation parameters:                                     │
+│     sample_per_min = int(10 Hz * 60s) = 600 samples                   │
+│     samples_per_tr = int(10 Hz / 0.5 Hz) = 20 samples                 │
+│     k = (len(gastric) - 2*sample_per_min) / samples_per_tr            │
+│     Typical k ≈ 200-300 permutations                                  │
+│                                                                         │
+│   Initialize null arrays:                                              │
+│     plv_null = np.zeros((N_voxels, k))                                │
+│     awplv_null = np.zeros((N_voxels, k))                              │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ PERMUTATION LOOP:                                            │     │
+│   │                                                               │     │
+│   │ for i in range(k):                                           │     │
+│   │     # Roll gastric signal                                     │     │
+│   │     roll_amount = sample_per_min + (i * samples_per_tr)      │     │
+│   │     gastric_perm = np.roll(gastric, roll_amount)             │     │
+│   │                                                               │     │
+│   │     # Compute PLV with permuted gastric                       │     │
+│   │     gastric_phase_perm = to_phase_resampled(gastric_perm,    │     │
+│   │                                              10, 0.5)         │     │
+│   │     phase_diff_perm = brain_phase - gastric_phase_perm       │     │
+│   │     plv_null[:, i] = np.abs(np.mean(                         │     │
+│   │         np.exp(1j * phase_diff_perm), axis=1))               │     │
+│   │                                                               │     │
+│   │     # Compute awPLV with permuted gastric                     │     │
+│   │     # (same resampling and weighting as empirical)            │     │
+│   │     gastric_perm_resampled = resample(gastric_perm)          │     │
+│   │     gastric_perm_analytic = hilbert(gastric_perm_resampled)  │     │
+│   │     amp_perm = np.abs(brain_analytic) *                      │     │
+│   │                np.abs(gastric_perm_analytic)                 │     │
+│   │     weights_perm = amp_perm / sum(amp_perm)                  │     │
+│   │     phase_diff_perm = angle(brain_analytic) -                │     │
+│   │                       angle(gastric_perm_analytic)           │     │
+│   │     awplv_null[:, i] = np.abs(np.sum(                        │     │
+│   │         weights_perm * np.exp(1j * phase_diff_perm), axis=1))│     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   Result:                                                               │
+│     plv_null: (N_voxels, k) - null distribution per voxel             │
+│     awplv_null: (N_voxels, k) - null distribution per voxel           │
+│                                                                         │
+│ STEP 3A.5: STATISTICAL INFERENCE                                      │
+│ ──────────────────────────────                                         │
+│                                                                         │
+│   P-values (uncorrected):                                              │
+│     plv_p = (plv_null < plv_empirical[:, np.newaxis]).mean(axis=1)   │
+│     awplv_p = (awplv_null < awplv_empirical[:, np.newaxis]).mean(axis=1) │
+│                                                                         │
+│   Effect sizes (delta):                                                │
+│     plv_delta = plv_empirical - np.median(plv_null, axis=1)           │
+│     awplv_delta = awplv_empirical - np.median(awplv_null, axis=1)     │
+│                                                                         │
+│   Null statistics:                                                      │
+│     plv_null_median = np.median(plv_null, axis=1)                     │
+│     awplv_null_median = np.median(awplv_null, axis=1)                 │
+│                                                                         │
+│ STEP 3A.6: SAVE NIFTI MAPS (8 files)                                  │
+│ ───────────────────────────────────────                                │
+│                                                                         │
+│   Reconstruction to 3D space:                                           │
+│     vol = np.zeros(original_fmri.shape[:3])  # (X, Y, Z)              │
+│     vol[mask] = measure_values  # Fill masked voxels                   │
+│     img = nib.Nifti1Image(vol, affine=fmri.affine,                    │
+│                          header=fmri.header)                           │
+│                                                                         │
+│   PLV Maps (4 files):                                                  │
+│     1. plvs_empirical_*.nii.gz                                         │
+│     2. plv_p_vals_*.nii.gz                                             │
+│     3. plv_delta_*.nii.gz                                              │
+│     4. plv_permut_median_*.nii.gz                                      │
+│                                                                         │
+│   awPLV Maps (4 files):                                                │
+│     5. awplvs_empirical_*.nii.gz                                       │
+│     6. awplv_p_vals_*.nii.gz                                           │
+│     7. awplv_delta_*.nii.gz                                            │
+│     8. awplv_permut_median_*.nii.gz                                    │
+│                                                                         │
+│   Save location:                                                        │
+│     derivatives/brain_gast/{subject}/{subject}{run}/                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+EXAMPLE OUTPUT (AE run 1):
+  PLV: mean=0.199, std=0.101
+  awPLV: mean=0.272, std=0.133
+  Null permutations: 210
+  Maps saved: 8 NIfTI files
+
+================================================================================
+    STAGE 3B: PLV/awPLV CALCULATION - V3 APPROACH (voxel_based_analysis_v3.py)
+================================================================================
+
+COMMAND:
+  python synchrony_analysis/voxel_based_analysis_v3.py
+
+NULL DISTRIBUTION: Between-subject mismatch
+
+KEY DIFFERENCES FROM V2:
+  • Processes all subjects at once (batch mode)
+  • Null: Subject's brain vs OTHER subjects' gastric signals
+  • Includes FDR and Bonferroni correction
+  • Outputs CSV with comprehensive statistics
+
+DETAILED WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ STEP 3B.1: LOAD ALL SUBJECTS' DATA                                    │
+│ ────────────────────────────────────                                   │
+│   Read metadata: egg_brain_meta_data_10subjects.csv                   │
+│                                                                         │
+│   For each (subject, run):                                             │
+│     Load gastric_signal                                                │
+│     Load brain_signal                                                  │
+│     Load mask                                                           │
+│     Store in all_data dictionary                                       │
+│                                                                         │
+│   Result: all_data = {                                                 │
+│     ('LA', 1): {'gastric': [...], 'brain': [...], 'mask': [...]},    │
+│     ('LA', 2): {...},                                                  │
+│     ...                                                                 │
+│   }                                                                     │
+│                                                                         │
+│ STEP 3B.2: COMPUTE EMPIRICAL PLV/awPLV (ALL SUBJECTS)                │
+│ ───────────────────────────────────────────────────                    │
+│   For each subject-run:                                                │
+│     plv_empirical = calc_plv(brain, gastric)                          │
+│     awplv_empirical = calc_awplv(brain, gastric)                      │
+│     Store in empirical_results                                         │
+│                                                                         │
+│   (PLV/awPLV calculation same as V2 - see STEP 3A.2 and 3A.3)        │
+│                                                                         │
+│ STEP 3B.3: COMPUTE NULL DISTRIBUTION (MISMATCH)                       │
+│ ─────────────────────────────────────────────                          │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ MISMATCH NULL APPROACH:                                      │     │
+│   │                                                               │     │
+│   │ For subject S (e.g., LA run 1):                              │     │
+│   │   brain_S = all_data[('LA', 1)]['brain']                     │     │
+│   │   null_plvs = []                                              │     │
+│   │   null_awplvs = []                                            │     │
+│   │                                                               │     │
+│   │   For each OTHER subject S' (e.g., BS, AE, EdZ, ...):        │     │
+│   │     if S' == S:                                               │     │
+│   │       continue  # Skip same subject (all runs)               │     │
+│   │                                                               │     │
+│   │     gastric_S' = all_data[(S', run')]['gastric']             │     │
+│   │                                                               │     │
+│   │     # Compute null synchrony                                  │     │
+│   │     plv_null = calc_plv(brain_S, gastric_S')                 │     │
+│   │     awplv_null = calc_awplv(brain_S, gastric_S')             │     │
+│   │                                                               │     │
+│   │     null_plvs.append(plv_null)                                │     │
+│   │     awplvs.append(awplv_null)                                 │     │
+│   │                                                               │     │
+│   │   # Result: 7-9 null samples (for 10 subjects total)         │     │
+│   │   null_plvs = np.array(null_plvs)  # Shape: (N_null, N_voxels) │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│ STEP 3B.4: STATISTICAL INFERENCE WITH CORRECTION                      │
+│ ──────────────────────────────────────────────                         │
+│                                                                         │
+│   P-values (per voxel):                                                │
+│     p_plv = (null_plvs ≥ plv_empirical).mean(axis=0)                  │
+│     p_awplv = (null_awplvs ≥ awplv_empirical).mean(axis=0)            │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ FDR CORRECTION (Benjamini-Hochberg):                         │     │
+│   │                                                               │     │
+│   │ from scipy.stats import false_discovery_control              │     │
+│   │ p_fdr_plv = false_discovery_control(p_plv, method='bh')      │     │
+│   │ p_fdr_awplv = false_discovery_control(p_awplv, method='bh')  │     │
+│   │                                                               │     │
+│   │ sig_fdr_plv = p_fdr_plv < 0.05                               │     │
+│   │ sig_fdr_awplv = p_fdr_awplv < 0.05                           │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ BONFERRONI CORRECTION:                                       │     │
+│   │                                                               │     │
+│   │ bonferroni_alpha = 0.05 / N_voxels                           │     │
+│   │ Example: 0.05 / 272500 = 1.835e-7                            │     │
+│   │                                                               │     │
+│   │ sig_bonf_plv = p_plv < bonferroni_alpha                      │     │
+│   │ sig_bonf_awplv = p_awplv < bonferroni_alpha                  │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│ STEP 3B.5: SAVE OUTPUTS                                               │
+│ ─────────────────────────                                              │
+│                                                                         │
+│   NIfTI Maps (same 8 as V2):                                           │
+│     Location: derivatives/brain_gast/{subject}/{subject}{run}/        │
+│                                                                         │
+│   CSV Statistics:                                                       │
+│     File: derivatives/brain_gast_voxel_analysis_v3/                   │
+│           individual_level_statistics.csv                              │
+│                                                                         │
+│     Columns (23 total):                                                │
+│       subject, run                                                     │
+│       plv_empirical, plv_null_median, plv_null_mean, plv_null_std     │
+│       plv_median, plv_std                                              │
+│       awplv_empirical, awplv_null_median, awplv_null_mean, ...        │
+│       n_sig_voxels_uncorrected_plv                                     │
+│       n_sig_voxels_fdr_plv                                             │
+│       n_sig_voxels_bonferroni_plv                                      │
+│       (same for awplv)                                                 │
+│       n_voxels, n_null_subjects, bonferroni_alpha                      │
+│                                                                         │
+│   Summary plots:                                                        │
+│     Location: plots/brain_gast_voxel_v3/                              │
+│     File: individual_level_summary.png                                 │
+│     Content: 4-panel plot (PLV/awPLV means and sig voxels)            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+EXAMPLE OUTPUT (10 subjects):
+  Subject AE run 1:
+    PLV mean: 0.199, FDR sig voxels: 45,357 / 272,500 (16.6%)
+    awPLV mean: 0.272, FDR sig voxels: 30,625 / 272,500 (11.2%)
+
+================================================================================
+         STAGE 4: GROUP-LEVEL ANALYSIS (voxel_based_second_level_v2.py)
+================================================================================
+
+COMMAND:
+  python synchrony_analysis/voxel_based_second_level_v2.py \
+      --metadata dataframes/egg_brain_meta_data_10subjects.csv
+
+PURPOSE:
+  Population-level paired t-test (empirical vs null) using FSL Randomise
+
+DETAILED WORKFLOW:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ STEP 4.1: AVERAGE WITHIN SUBJECTS (MULTIPLE RUNS)                     │
+│ ───────────────────────────────────────────────                        │
+│   For each subject with multiple runs:                                 │
+│     Load all run maps (e.g., AE: runs 1, 2, 3)                        │
+│     Average: plv_mean = mean(plv_run1, plv_run2, plv_run3)            │
+│     Save: plv_empirical_AE_mean_runsstrict.nii.gz                     │
+│                                                                         │
+│   Repeat for all 6 measures:                                           │
+│     plv_empirical, plv_permut_median, plv_delta                        │
+│     awplv_empirical, awplv_permut_median, awplv_delta                 │
+│                                                                         │
+│ STEP 4.2: AVERAGE ACROSS SUBJECTS (GROUP MEAN)                        │
+│ ────────────────────────────────────────────                           │
+│   For each measure:                                                     │
+│     Load all subjects' averaged maps                                   │
+│     Grand mean: measure_group = mean across subjects                   │
+│     Save: {measure}_mean_subjectsstrict.nii.gz                        │
+│                                                                         │
+│   Location: derivatives/brain_gast/                                    │
+│                                                                         │
+│ STEP 4.3: CREATE FSL RANDOMISE DESIGN                                 │
+│ ───────────────────────────────────────                                │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ DESIGN MATRIX (Paired t-test):                              │     │
+│   │                                                               │     │
+│   │ For N subjects (rows = 2N):                                  │     │
+│   │                                                               │     │
+│   │        EV1  EV2  EV3  ...  EV_N+1                           │     │
+│   │ ───────────────────────────────────────────────────────      │     │
+│   │ Sub1    1    1    0   ...    0       ← Empirical            │     │
+│   │ Sub2    1    0    1   ...    0       ← Empirical            │     │
+│   │ ...    ...  ...  ...  ...   ...                             │     │
+│   │ SubN    1    0    0   ...    1       ← Empirical            │     │
+│   │ Sub1   -1    1    0   ...    0       ← Null                 │     │
+│   │ Sub2   -1    0    1   ...    0       ← Null                 │     │
+│   │ ...    ...  ...  ...  ...   ...                             │     │
+│   │ SubN   -1    0    0   ...    1       ← Null                 │     │
+│   │                                                               │     │
+│   │ EV1: Main effect (empirical - null)                         │     │
+│   │ EV2-EV_N+1: Subject intercepts                              │     │
+│   │                                                               │     │
+│   │ Saved: fsl_randomize/design.mat                             │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   Contrast: [1  0  0  ...  0]  (test EV1 > 0)                         │
+│   Exchange blocks: [1 2 3...N 1 2 3...N]  (subject pairing)           │
+│                                                                         │
+│ STEP 4.4: CREATE 4D INPUT FILES                                       │
+│ ─────────────────────────────────                                      │
+│   Concatenate subject maps:                                            │
+│                                                                         │
+│   PLV 4D:                                                               │
+│     [plvs_empirical_sub1, plvs_empirical_sub2, ...,                   │
+│      plv_permut_median_sub1, plv_permut_median_sub2, ...]             │
+│     Shape: (X, Y, Z, 2N)                                               │
+│     Save: fsl_randomize/4d_plv.nii.gz                                 │
+│                                                                         │
+│   awPLV 4D:                                                             │
+│     [awplvs_empirical_sub1, awplvs_empirical_sub2, ...,               │
+│      awplv_permut_median_sub1, awplv_permut_median_sub2, ...]         │
+│     Shape: (X, Y, Z, 2N)                                               │
+│     Save: fsl_randomize/4d_awplv.nii.gz                               │
+│                                                                         │
+│ STEP 4.5: RUN FSL RANDOMISE (PLV)                                     │
+│ ───────────────────────────────────                                    │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────┐     │
+│   │ FSL RANDOMISE COMMAND:                                       │     │
+│   │                                                               │     │
+│   │ randomise \                                                   │     │
+│   │   -i fsl_randomize/4d_plv.nii.gz \                           │     │
+│   │   -o fsl_randomize/result_plv_strict_ \                      │     │
+│   │   -d fsl_randomize/design.mat \                              │     │
+│   │   -t fsl_randomize/design.con \                              │     │
+│   │   -e fsl_randomize/design.grp \                              │     │
+│   │   -m fsl_randomize/mask.nii.gz \                             │     │
+│   │   -n 10000 \              # Number of permutations           │     │
+│   │   -T \                    # TFCE correction                  │     │
+│   │   --uncorrp \             # Uncorrected p-values             │     │
+│   │   -c 2.3 \                # Cluster-forming threshold        │     │
+│   │   -C 2.3                  # Cluster mass threshold           │     │
+│   │                                                               │     │
+│   │ Runtime: ~30-60 minutes per measure                          │     │
+│   └─────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│   Outputs (PLV):                                                        │
+│     result_plv_strict_tstat1.nii.gz                                    │
+│     result_plv_strict_tfce_corrp_tstat1.nii.gz  ← RECOMMENDED         │
+│     result_plv_strict_vox_p_tstat1.nii.gz                              │
+│     result_plv_strict_clustere_corrp_tstat1.nii.gz                     │
+│     result_plv_strict_clusterm_corrp_tstat1.nii.gz                     │
+│                                                                         │
+│ STEP 4.6: RUN FSL RANDOMISE (awPLV)                                   │
+│ ─────────────────────────────────────                                  │
+│   Same command as PLV, but:                                            │
+│     Input: 4d_awplv.nii.gz                                             │
+│     Output prefix: result_awplv_strict_                                │
+│                                                                         │
+│   Outputs (awPLV):                                                      │
+│     result_awplv_strict_tstat1.nii.gz                                  │
+│     result_awplv_strict_tfce_corrp_tstat1.nii.gz  ← RECOMMENDED       │
+│     result_awplv_strict_vox_p_tstat1.nii.gz                            │
+│     result_awplv_strict_clustere_corrp_tstat1.nii.gz                   │
+│     result_awplv_strict_clusterm_corrp_tstat1.nii.gz                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+OUTPUT INTERPRETATION:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│ *_tfce_corrp_tstat1.nii.gz (RECOMMENDED):                             │
+│   Values: 1-p (corrected)                                              │
+│   Threshold: > 0.95 for p < 0.05                                       │
+│   Method: TFCE (combines intensity and spatial extent)                 │
+│                                                                         │
+│ *_tstat1.nii.gz:                                                       │
+│   Values: t-statistics                                                 │
+│   Positive: empirical > null                                           │
+│   Negative: empirical < null                                           │
+│                                                                         │
+│ Visualization:                                                          │
+│   fsleyes result_plv_strict_tfce_corrp_tstat1.nii.gz \                │
+│       -cm red-yellow -dr 0.95 1.0                                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+                        COMPLETE PIPELINE EXECUTION
+================================================================================
+
+FULL WORKFLOW (Single Subject):
+┌─────────────────────────────────────────────────────────────────────────┐
+│ # Setup                                                                 │
+│ conda activate brain_gut                                                │
+│ export FSL_DIR=/usr/local/fsl                                          │
+│ cd main_project_path/code                                              │
+│                                                                         │
+│ # Subject and run                                                       │
+│ SUBJECT=AE                                                              │
+│ RUN=1                                                                   │
+│                                                                         │
+│ # Stage 1: Prepare AFNI data                                           │
+│ python synchrony_analysis/prepare_afni_data.py $SUBJECT $RUN           │
+│                                                                         │
+│ # Stage 2: Temporal alignment                                          │
+│ python synchrony_analysis/signal_slicing_v2.py $SUBJECT $RUN           │
+│                                                                         │
+│ # Stage 3: PLV/awPLV calculation (V2 approach)                         │
+│ python synchrony_analysis/voxel_based_analysis_v2.py $SUBJECT $RUN     │
+│                                                                         │
+│ # Check outputs                                                         │
+│ ls ../derivatives/brain_gast/$SUBJECT/${SUBJECT}${RUN}/*.nii.gz        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+BATCH PROCESSING (All Subjects):
+┌─────────────────────────────────────────────────────────────────────────┐
+│ METADATA=dataframes/egg_brain_meta_data_10subjects.csv                 │
+│                                                                         │
+│ while IFS=, read -r subject run rest; do                               │
+│     if [ "$subject" != "subject" ]; then                               │
+│         echo "Processing $subject run $run..."                         │
+│         python synchrony_analysis/prepare_afni_data.py $subject $run   │
+│         python synchrony_analysis/signal_slicing_v2.py $subject $run   │
+│         python synchrony_analysis/voxel_based_analysis_v2.py $subject $run │
+│     fi                                                                  │
+│ done < $METADATA                                                        │
+│                                                                         │
+│ # Group-level analysis                                                  │
+│ python synchrony_analysis/voxel_based_second_level_v2.py               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+V3 WORKFLOW (Population-level):
+┌─────────────────────────────────────────────────────────────────────────┐
+│ # Prerequisite: Complete Stages 1-2 for all subjects                   │
+│                                                                         │
+│ # Run V3 analysis (batch mode)                                         │
+│ python synchrony_analysis/voxel_based_analysis_v3.py                   │
+│                                                                         │
+│ # Check outputs                                                         │
+│ cat ../derivatives/brain_gast_voxel_analysis_v3/individual_level_statistics.csv │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+                         KEY TECHNICAL PARAMETERS
+================================================================================
+
+SAMPLING RATES:
+  fMRI: 0.5 Hz (TR = 2s)
+  Gastric original: 10 Hz
+  Gastric peak frequency: ~0.05 Hz (0.033-0.067 Hz range)
+
+FILTERING:
+  Bandpass: 0.02-0.08 Hz (gastric rhythm range)
+  Method: MNE FIR filter with Hamming window
+  Order: 3
+
+PHASE EXTRACTION:
+  Method: Hilbert transform
+  Range: [-π, π] radians
+  Resampling: Linear interpolation (gastric 10 Hz → fMRI 0.5 Hz)
+
+NULL DISTRIBUTIONS:
+  V2 (Temporal): Circular rolling by 1-min increments, ~200-300 samples
+  V3 (Mismatch): Between-subject pairing, N-1 samples (7-9 for 10 subjects)
+
+MULTIPLE COMPARISON CORRECTION:
+  FDR: Benjamini-Hochberg, q < 0.05
+  Bonferroni: α = 0.05 / N_voxels (typically ~1.8e-7)
+  Group: FSL TFCE with 10,000 permutations
+
+EXPECTED VALUES:
+  PLV: mean ~0.15-0.20, std ~0.05-0.10
+  awPLV: mean ~0.22-0.28, std ~0.10-0.15
+  awPLV > PLV (emphasizes high-amplitude coupling)
+
+================================================================================
+                              REFERENCES
+================================================================================
+
+• Lachaux et al. (1999). Measuring phase synchrony in brain signals.
+  Human Brain Mapping, 8(4), 194-208.
+
+• Cohen (2014). Analyzing Neural Time Series Data: Theory and Practice.
+  MIT Press.
+
+• Maris & Oostenveld (2007). Nonparametric statistical testing.
+  J Neurosci Methods, 164(1), 177-190.
+
+• Benjamini & Hochberg (1995). Controlling the false discovery rate.
+  JRSS Series B, 57(1), 289-300.
+
+• Smith & Nichols (2009). Threshold-free cluster enhancement.
+  NeuroImage, 44(1), 83-98.
+
+================================================================================
+                            END OF FLOWCHART
+================================================================================
+
+Last updated: December 19, 2024
+Pipeline version: 3.0 (Streamlined Brain-Gastric Synchrony)
