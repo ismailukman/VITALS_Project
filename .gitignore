@@ -44,3 +44,11 @@ subject_data_nii/
 # Synchrony analysis output (large result files)
 synchrony_analysis/output/*
 !synchrony_analysis/output/.gitkeep
+
+# ROI analysis output
+roi_analysis/output/*
+!roi_analysis/output/.gitkeep
+
+# Network analysis output
+network_analysis/output/*
+!network_analysis/output/.gitkeep
