@@ -1,33 +1,37 @@
-# EGG (Electrogastrography) Preprocessing Pipeline
+# VITALS Gastric-Brain Synchrony Analysis
 
-This module provides a complete pipeline for preprocessing EGG (electrogastrography) data recorded during fMRI sessions. The pipeline extracts and filters gastric slow-wave signals for subsequent synchrony analysis with brain/motion data.
+This repository contains the EGG preprocessing pipeline and EGG-Brain synchrony analysis for the VITALS project, investigating phase coupling between the gastric slow wave and brain BOLD signals.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Data Organization](#data-organization)
-- [Metadata File Format](#metadata-file-format)
-- [Usage](#usage)
-  - [Single Subject Processing](#single-subject-processing)
-  - [Batch Processing](#batch-processing)
-- [Processing Pipeline](#processing-pipeline)
-- [Output Files](#output-files)
+- [Project Structure](#project-structure)
+- [EGG Preprocessing](#egg-preprocessing)
+  - [Data Organization](#data-organization)
+  - [Metadata File Format](#metadata-file-format)
+  - [Usage](#usage)
+  - [Processing Pipeline](#processing-pipeline)
+  - [Output Files](#output-files)
+- [ROI-Level Synchrony Analysis](#roi-level-synchrony-analysis)
+  - [Atlas](#atlas)
+  - [Synchrony Metrics](#synchrony-metrics)
+  - [Statistical Testing](#statistical-testing)
+  - [Running the Analysis](#running-the-analysis)
+  - [ROI Analysis Output](#roi-analysis-output)
+- [Increasing the Data for Synchrony Analysis](#increasing-the-data-for-synchrony-analysis)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
 ## Overview
 
-Electrogastrography (EGG) records the electrical activity of the stomach using surface electrodes placed on the abdomen. The gastric slow wave typically oscillates at **0.033-0.066 Hz** (2-4 cycles per minute), known as the normogastric frequency range.
+The project has two main components:
 
-This preprocessing pipeline:
+1. **EGG Preprocessing** (`preprocess_egg_data/`): Reads raw EGG data from AcqKnowledge/Biopac format, aligns with fMRI acquisition, identifies the dominant gastric frequency, and outputs cleaned filtered signals.
 
-1. Reads raw EGG data from AcqKnowledge/Biopac format (.acq files)
-2. Aligns the EGG signal with fMRI acquisition using trigger signals
-3. Identifies the dominant gastric frequency for each subject
-4. Applies narrow bandpass filtering around the dominant frequency
-5. Outputs cleaned, filtered gastric signals ready for synchrony analysis
+2. **ROI-Level Synchrony Analysis** (`roi_analysis/`): Computes phase locking value (PLV) and amplitude-weighted PLV (awPLV) between the gastric rhythm and brain ROI time series extracted using a 132-ROI composite atlas.
 
 ---
 
@@ -48,19 +52,50 @@ scikit-learn>=0.24.0
 ### Installation
 
 ```bash
-# Create a virtual environment (recommended)
-python -m venv egg_env
-source egg_env/bin/activate  # On Windows: egg_env\Scripts\activate
+# Using conda (recommended)
+conda activate brain_gut
 
-# Install dependencies
-pip install numpy scipy pandas matplotlib mne bioread scikit-learn
+# Or install dependencies manually
+pip install numpy scipy pandas matplotlib mne bioread scikit-learn nibabel nilearn seaborn
 ```
 
 ---
 
-## Data Organization
+## Project Structure
 
-### Input Data Structure
+```
+VITALS_Gastric_Brain_Synchrony/
+├── README.md
+├── .gitignore
+├── preprocess_egg_data/          # EGG preprocessing pipeline
+│   ├── config.py                 # Central configuration
+│   ├── preprocess_gastric_data.py
+│   ├── egg_brain_metadata.csv    # Subject metadata
+│   ├── requirements.txt
+│   └── utils/
+│       ├── gastric_utils.py
+│       └── spect_utils.py
+├── roi_analysis/                 # ROI-level EGG-brain synchrony
+│   ├── roi_based_analysis.py     # Main analysis script
+│   └── output/                   # Results (gitignored)
+│       ├── roi_synchrony_results.csv
+│       ├── roi_summary_statistics.csv
+│       └── plots/
+├── egg_data/                     # Raw EGG .acq files (gitignored)
+├── atlas/                        # Brain atlas files (gitignored)
+│   ├── atlas.nii                 # 132-ROI composite atlas
+│   ├── atlas.txt                 # ROI labels
+│   └── atlas.groups.info         # 22 network groupings
+└── subject_data_nii/             # Preprocessed fMRI NIfTI (gitignored)
+```
+
+---
+
+## EGG Preprocessing
+
+### Data Organization
+
+#### Input Data Structure
 
 Place your raw EGG data in the `egg_data/` folder following this structure:
 
@@ -75,7 +110,7 @@ egg_data/
 └── ...
 ```
 
-### Expected .acq File Contents
+#### Expected .acq File Contents
 
 Each `.acq` file should contain:
 
@@ -85,7 +120,7 @@ Each `.acq` file should contain:
 
 ---
 
-## Metadata File Format
+### Metadata File Format
 
 Create a metadata CSV file (`egg_metadata.csv`) with the following columns:
 
@@ -112,9 +147,9 @@ The metadata file `egg_metadata.csv` is located in the `preprocess_egg_data/` fo
 
 ---
 
-## Usage
+### Usage
 
-### Single Subject Processing
+#### Single Subject Processing
 
 Process one subject/run at a time:
 
@@ -150,7 +185,7 @@ Output files saved:
   - Plots: output/plots/VITD0107/VITD01071/
 ```
 
-### Batch Processing
+#### Batch Processing
 
 Process all subjects defined in the metadata file:
 
@@ -191,7 +226,7 @@ Failed: 0/3
 
 ---
 
-## Processing Pipeline
+### Processing Pipeline
 
 The preprocessing pipeline consists of the following steps:
 
@@ -239,9 +274,9 @@ Step 8: OUTPUT
 
 ---
 
-## Output Files
+### Output Files
 
-### Directory Structure
+#### Directory Structure
 
 After processing, the output folder will contain:
 
@@ -269,7 +304,7 @@ preprocess_egg_data/
         └── ...
 ```
 
-### Output Data Format
+#### Output Data Format
 
 **Filtered Signal** (`gast_data_*.npy`):
 
@@ -300,6 +335,92 @@ print(f"Dominant frequency: {freq:.4f} Hz ({freq*60:.2f} cycles/min)")
 
 ---
 
+---
+
+## ROI-Level Synchrony Analysis
+
+### Atlas
+
+The analysis uses the CONN toolbox default 132-ROI composite atlas (`atlas/atlas.nii`), comprising:
+
+| Source Atlas | ROIs | Description |
+|---|---|---|
+| Harvard-Oxford Cortical | 91 | Bilateral cortical areas split into L/R |
+| Harvard-Oxford Subcortical | 15 | Subcortical structures (excluding WM/CSF) |
+| AAL Cerebellar | 26 | Cerebellar parcellation |
+| **Total** | **132** | |
+
+### Synchrony Metrics
+
+For each subject, the script:
+1. Extracts mean ROI time series from fMRI using the atlas
+2. Bandpass-filters both brain and EGG signals around the subject-specific gastric frequency (~0.05 Hz)
+3. Computes two synchrony metrics between the gastric rhythm and each ROI:
+
+- **PLV (Phase Locking Value)**: Consistency of phase difference over time. Range [0, 1].
+- **awPLV (Amplitude-Weighted PLV)**: PLV weighted by instantaneous signal amplitude. Captures synchrony that co-varies with signal strength.
+
+### Statistical Testing
+
+- **Null distribution**: Mismatch approach — each subject's brain data is paired with other subjects' EGG signals to create null PLV/awPLV values.
+- **Per-ROI p-values**: Proportion of null values ≥ empirical value.
+- **Multiple comparison correction**: FDR (Benjamini-Hochberg) across all ROIs within each subject.
+- **Pooled test**: Mann-Whitney U (one-sided) comparing all empirical vs all null values across subjects.
+
+### Running the Analysis
+
+```bash
+conda activate brain_gut
+cd /path/to/VITALS_Gastric_Brain_Synchrony
+
+# Ensure EGG preprocessing is done first
+python preprocess_egg_data/preprocess_gastric_data.py --batch
+
+# Run ROI synchrony analysis
+python roi_analysis/roi_based_analysis.py
+```
+
+**Prerequisites**: Raw fMRI NIfTI files in `subject_data_nii/` and atlas files in `atlas/` (both gitignored due to size).
+
+### ROI Analysis Output
+
+```
+roi_analysis/output/
+├── roi_synchrony_results.csv       # Per-subject, per-ROI PLV/awPLV with p-values
+├── roi_summary_statistics.csv      # Mean PLV/awPLV per ROI across subjects
+└── plots/
+    ├── roi_density_grid_top20.png  # Paired PLV+awPLV density for top 20 ROIs
+    ├── roi_pooled_density.png      # Pooled empirical vs null distributions
+    ├── roi_synchrony_heatmap.png   # PLV/awPLV heatmap (ROI × subject)
+    ├── roi_significance_barplot.png # Top ROIs by significance count
+    └── roi_distribution.png        # Histogram of all PLV/awPLV values
+```
+
+**CSV columns**: `subject`, `run`, `roi_index`, `roi_name`, `plv_empirical`, `plv_null_mean`, `plv_delta`, `p_value_plv`, `p_fdr_plv`, `sig_fdr_plv`, `awplv_empirical`, `awplv_null_mean`, `awplv_delta`, `p_value_awplv`, `p_fdr_awplv`, `sig_fdr_awplv`, `gastric_freq`
+
+---
+
+## Increasing the Data for Synchrony Analysis
+
+The current analysis uses 3 subjects with concurrent EGG and resting-state fMRI. To improve statistical power and reliability:
+
+### 1. Add More Subjects
+- The mismatch null distribution currently has only 2 null samples per subject (N-1 other subjects). With more subjects, the null becomes richer and p-values more granular (currently limited to {0.0, 0.5, 1.0}).
+- **Minimum recommended**: 10+ subjects for meaningful FDR-corrected inference; 20+ for robust group-level statistics.
+- To add a new subject: place the raw `.acq` in `egg_data/`, the preprocessed fMRI NIfTI in `subject_data_nii/`, add a row to `egg_brain_metadata.csv`, and add the subject ID to `SUBJECTS_WITH_BRAIN_DATA` in the analysis script.
+
+### 2. Include Multiple Runs per Subject
+- If subjects have multiple fMRI runs with concurrent EGG, each run can be processed independently. Update the metadata CSV with separate rows per run. This increases total observations and strengthens within-subject reliability.
+
+### 3. Surrogate-Based Null Distribution
+- Instead of relying solely on the mismatch null (limited by N-1 pairs), implement **phase-shuffled surrogates**: randomly shift the gastric phase time series by a circular permutation (preserving autocorrelation) and recompute PLV/awPLV. This can generate hundreds or thousands of null samples per subject regardless of sample size, yielding finer-grained p-values.
+
+### 4. Task-Based Paradigms
+- The current analysis uses resting-state data. If EGG was also recorded during task fMRI (e.g., MID task, movie watching), those runs can be analyzed separately to examine how gastric-brain coupling changes across conditions.
+
+---
+
 ## Acknowledgments
 
-Based on analysis provided by Levakov https://github.com/GidLev/brain_gastric_synchronization_2023/tree/master.
+- EGG preprocessing pipeline based on [Levakov et al. 2023](https://github.com/GidLev/brain_gastric_synchronization_2023/tree/master)
+- Atlas: CONN toolbox default atlas — Harvard-Oxford (Desikan et al. 2006; Frazier et al. 2005) + AAL Cerebellar (Tzourio-Mazoyer et al. 2002)

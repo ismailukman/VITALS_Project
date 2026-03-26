@@ -20,7 +20,6 @@ Usage:
     python roi_based_analysis.py
     python roi_based_analysis.py --metadata path/to/metadata.csv
 
-Author: EGG-Brain Synchrony Project
 """
 
 import os
@@ -306,14 +305,14 @@ def resample_gastric_to_fmri(gastric_signal, gastric_sr, fmri_sr, n_fmri_timepoi
 
 
 ##############################################################################
-# V5-Style Density/Detail Plots                                              #
+# Density/Detail Plots                                              #
 ##############################################################################
 
 def plot_roi_density_grid(results_df, null_results, all_subjects_data, 
                           empirical_results, valid_rois, roi_labels, 
                           plot_dir, n_top=20):
     """
-    Create a v5-style grid of PLV/awPLV density plots for top ROIs.
+    Create a PLV/awPLV density plots for top ROIs.
     
     For each of the top N ROIs (by PLV delta), shows side-by-side PLV and awPLV
     panels with empirical vs null distributions and significance markers.
