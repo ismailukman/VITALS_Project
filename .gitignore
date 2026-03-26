@@ -49,6 +49,5 @@ synchrony_analysis/output/*
 roi_analysis/output/*
 !roi_analysis/output/.gitkeep
 
-# Network analysis output
-network_analysis/output/*
-!network_analysis/output/.gitkeep
+# Network analysis (not pushed)
+network_analysis/
