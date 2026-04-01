@@ -33,7 +33,7 @@ import pandas as pd
 import nibabel as nib
 from scipy import signal
 from scipy.signal import hilbert
-from scipy.stats import false_discovery_control
+from scipy.stats import false_discovery_control, mannwhitneyu
 from scipy.interpolate import interp1d
 from mne.filter import filter_data
 import matplotlib.pyplot as plt
@@ -564,6 +564,15 @@ def _sig_marker(p):
     return ''
 
 
+def _safe_mannwhitney_u(empirical_value, null_values):
+    """Return a one-vs-null Mann-Whitney U statistic for a single ROI."""
+    null_values = np.asarray(null_values)
+    if null_values.size == 0:
+        return np.nan
+    stat, _ = mannwhitneyu([empirical_value], null_values, alternative='greater')
+    return float(stat)
+
+
 ##############################################################################
 # Main Analysis                                                              #
 ##############################################################################
@@ -771,6 +780,8 @@ def main(metadata_path=None):
         # FDR correction across ROIs
         p_fdr_plv = false_discovery_control(p_values_plv, method='bh')
         p_fdr_awplv = false_discovery_control(p_values_awplv, method='bh')
+        p_bonferroni_plv = np.minimum(p_values_plv * n_rois, 1.0)
+        p_bonferroni_awplv = np.minimum(p_values_awplv * n_rois, 1.0)
         
         null_results[(subject, run)] = {
             'null_plvs': null_plvs,
@@ -779,6 +790,8 @@ def main(metadata_path=None):
             'p_values_awplv': p_values_awplv,
             'p_fdr_plv': p_fdr_plv,
             'p_fdr_awplv': p_fdr_awplv,
+            'p_bonferroni_plv': p_bonferroni_plv,
+            'p_bonferroni_awplv': p_bonferroni_awplv,
             'plv_null_mean': np.mean(null_plvs, axis=0),
             'awplv_null_mean': np.mean(null_awplvs, axis=0)
         }
@@ -807,32 +820,58 @@ def main(metadata_path=None):
         
         for i, roi_idx in enumerate(subj_valid_rois):
             roi_name = roi_labels[roi_idx - 1] if roi_idx <= len(roi_labels) else f"ROI_{roi_idx}"
+            plv_empirical = emp['plv'][i]
+            awplv_empirical = emp['awplv'][i]
+            plv_null_mean = null['plv_null_mean'][i]
+            awplv_null_mean = null['awplv_null_mean'][i]
+            effect_size_plv = plv_empirical - plv_null_mean
+            effect_size_awplv = awplv_empirical - awplv_null_mean
             
             results_list.append({
                 'subject': subject,
                 'run': run,
                 'roi_index': roi_idx,
                 'roi_name': roi_name,
-                'plv_empirical': emp['plv'][i],
-                'plv_null_mean': null['plv_null_mean'][i],
-                'plv_delta': emp['plv'][i] - null['plv_null_mean'][i],
+                'n_empirical': 1,
+                'n_null': int(null['null_plvs'].shape[0]),
+                'plv_empirical': plv_empirical,
+                'effect_size_plv': effect_size_plv,
+                'effect_size_awplv': effect_size_awplv,
+                'mann_whitney_u_awplv': _safe_mannwhitney_u(awplv_empirical, null['null_awplvs'][:, i]),
+                'plv_null_mean': plv_null_mean,
+                'plv_delta': effect_size_plv,
                 'p_value_plv': null['p_values_plv'][i],
                 'p_fdr_plv': null['p_fdr_plv'][i],
+                'p_bonferroni_plv': null['p_bonferroni_plv'][i],
+                'sig_uncorrected_fdr_plv': null['p_values_plv'][i] < 0.05,
                 'sig_fdr_plv': null['p_fdr_plv'][i] < 0.05,
-                'awplv_empirical': emp['awplv'][i],
-                'awplv_null_mean': null['awplv_null_mean'][i],
-                'awplv_delta': emp['awplv'][i] - null['awplv_null_mean'][i],
+                'sig_bonferroni_plv': null['p_bonferroni_plv'][i] < 0.05,
+                'awplv_empirical': awplv_empirical,
+                'awplv_null_mean': awplv_null_mean,
+                'awplv_delta': effect_size_awplv,
                 'p_value_awplv': null['p_values_awplv'][i],
                 'p_fdr_awplv': null['p_fdr_awplv'][i],
+                'p_bonferroni_awplv': null['p_bonferroni_awplv'][i],
+                'sig_uncorrected_fdr_awplv': null['p_values_awplv'][i] < 0.05,
                 'sig_fdr_awplv': null['p_fdr_awplv'][i] < 0.05,
+                'sig_bonferroni_awplv': null['p_bonferroni_awplv'][i] < 0.05,
                 'gastric_freq': data['gastric_freq']
             })
     
     results_df = pd.DataFrame(results_list)
+    export_columns = [
+        'subject', 'run', 'roi_index', 'roi_name', 'n_empirical', 'n_null',
+        'plv_empirical', 'effect_size_plv', 'effect_size_awplv',
+        'mann_whitney_u_awplv', 'plv_null_mean', 'plv_delta', 'p_value_plv',
+        'p_value_awplv', 'gastric_freq', 'sig_uncorrected_fdr_plv',
+        'sig_uncorrected_fdr_awplv', 'sig_fdr_plv', 'sig_fdr_awplv',
+        'sig_bonferroni_plv', 'sig_bonferroni_awplv'
+    ]
+    results_export_df = results_df[export_columns]
     
     # Save results
     output_csv = OUTPUT_DIR / "roi_synchrony_results.csv"
-    results_df.to_csv(output_csv, index=False)
+    results_export_df.to_csv(output_csv, index=False)
     print(f"\n  ✓ Saved results to: {output_csv}")
     
     # STEP 5: Create summary statistics
