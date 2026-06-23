@@ -41,9 +41,8 @@ metadata_field_sources.txt
 atlas/
 subject_data_nii/
 
-# Synchrony analysis output (large result files)
-synchrony_analysis/output/*
-!synchrony_analysis/output/.gitkeep
+# Synchrony analysis (dev folder, not pushed)
+synchrony_analysis/
 
 # ROI analysis output
 roi_analysis/output/*
